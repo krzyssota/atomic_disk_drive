@@ -3,13 +3,15 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub static MAGIC_NUMBER: [u8; 4] = [0x61, 0x74, 0x64, 0x64];
-pub static READ: u8 = 0x01;
-pub static WRITE: u8 = 0x02;
-pub static  READ_PROC: u8 = 0x03;
-pub static VALUE: u8 = 0x04;
-pub static WRITE_PROC: u8 = 0x05;
-pub static ACK: u8 = 0x06;
-pub static RESPONSE: u8 = 0x40;
+pub static READ_MSG_T: u8 = 0x01;
+pub static WRITE_MSG_T: u8 = 0x02;
+pub static READ_PROC_MSG_T: u8 = 0x03;
+pub static VALUE_MSG_T: u8 = 0x04;
+pub static WRITE_PROC_MSG_T: u8 = 0x05;
+pub static ACK_MSG_T: u8 = 0x06;
+pub static RESPONSE_MSG_T: u8 = 0x40;
+pub const SECTOR_SIZE: usize = 4096;
+pub const HMAC_TAG_SIZE: usize = 32;
 
 pub struct Configuration {
     /// Hmac key to verify and sign internal requests.
