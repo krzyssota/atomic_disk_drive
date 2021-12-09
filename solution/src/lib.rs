@@ -6,6 +6,7 @@ mod domain;
 
 mod handle_cmd;
 use crate::handle_cmd::cmd::{get_cmd, handle_cmd};
+mod nnar;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
@@ -21,17 +22,18 @@ pub async fn run_register_process(config: Configuration) {
     let tcp_listener: TcpListener = TcpListener::bind((host.as_str(), *port)).await.unwrap();
     loop {
         match tcp_listener.accept().await {
-            Ok((tcp_stream, sock_addr)) => {
-                let (read_stream, write_stream) = tcp_stream.into_split();
-                let cmd = get_cmd(
-                    read_stream,
-                    write_stream, // todo maybe Arc
-                    config.hmac_system_key.clone(),
-                    config.hmac_client_key.clone(),
-                    config.public.max_sector,
-                )
-                .await;
-                let res = handle_cmd(cmd).await;
+            Ok((tcp_stream, _)) => {
+                let (mut read_stream, mut write_stream) = tcp_stream.into_split();
+                    loop {
+                        let cmd = get_cmd(
+                            &mut read_stream,
+                            &mut write_stream, // todo maybe Arc
+                            config.hmac_system_key.clone(),
+                            config.hmac_client_key.clone(),
+                            config.public.max_sector,
+                        ).await;
+                        let res = handle_cmd(cmd).await;
+                    }
             }
             Err(e) => {
                 log::error!("Error while accepting connection on TcpListener: {:?}", e);
@@ -43,8 +45,10 @@ pub async fn run_register_process(config: Configuration) {
 pub mod atomic_register_public {
     use crate::{
         ClientRegisterCommand, OperationComplete, RegisterClient, SectorsManager, StableStorage,
-        SystemRegisterCommand,
+        SystemRegisterCommand
     };
+    use crate::nnar::atomic_register::Nnar;
+
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -79,7 +83,7 @@ pub mod atomic_register_public {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: usize,
     ) -> Box<dyn AtomicRegister> {
-        unimplemented!()
+        Nnar::new(self_ident, metadata, register_client, sectors_manager, processes_count).await
     }
 }
 
@@ -231,9 +235,6 @@ pub mod transfer_public {
     ) -> Result<(RegisterCommand, bool), Error> {
         log::debug!("deserializing register command");
 
-        // TODO / In case of every other error, the solution shall consume the same number of bytes
-        // TODO / as if a message of this type was processed successfully.
-
         // slide over bytes in the stream until it detects a valid magic number
         let mut magic_buffer: [u8; 4] = [0; 4];
         data.read_exact(&mut magic_buffer).await.unwrap();
@@ -265,6 +266,8 @@ pub mod transfer_public {
                 ));
             }
         };
+        // TODO / In case of every other error, the solution shall consume the same number of bytes
+        // TODO / as if a message of this type was processed successfully.
         let cmd = if let Some(rank) = rank {
             deserialize_system_command(data, rank, msg_type, hmac_system_key, &mut msg).await
         } else {
@@ -337,11 +340,11 @@ pub mod transfer_public {
                 msg.append(&mut buffer.to_vec());
                 let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
                 // padding = buffer[8..15]
-                let wr = buffer[15];
+                let write_rank = buffer[15];
                 let sec_data = SectorVec(buffer[16..].to_vec());
                 SystemRegisterCommandContent::Value {
                     timestamp,
-                    write_rank: wr,
+                    write_rank,
                     sector_data: sec_data,
                 }
             }
@@ -351,11 +354,11 @@ pub mod transfer_public {
                 msg.append(&mut buffer.to_vec());
                 let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
                 // padding = buffer[8..15]
-                let wr = buffer[15];
+                let write_rank = buffer[15];
                 let sec_data = SectorVec(buffer[16..].to_vec());
                 SystemRegisterCommandContent::WriteProc {
                     timestamp,
-                    write_rank: wr,
+                    write_rank,
                     data_to_write: sec_data
                 }
             },

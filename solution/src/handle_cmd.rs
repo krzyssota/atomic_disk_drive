@@ -9,30 +9,23 @@ pub mod cmd {
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
     use crate::{deserialize_register_command, RegisterCommand};
 
-    pub async fn get_cmd(mut read_stream: OwnedReadHalf, write_stream: OwnedWriteHalf,
+    pub async fn get_cmd(read_stream: &mut OwnedReadHalf, write_stream: &mut OwnedWriteHalf,
                       hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], max_sector: u64) -> RegisterCommand {
-// todo add loop here
             let mut _buff: [u8; 1] = [0];
-        /*    match read_stream.peek(&mut _buff).await {
+            match read_stream.peek(&mut _buff).await {
                 Err(e) => {
                     log::error!("Error while peeking OwnedReadHalf of Tcp stream: {:?}", e);
+                    panic!();
                 },
-                Ok(0) => {}, // no bytes to read     // if in loop add break;
+                Ok(0) => {todo!()}, // no bytes to read     // if in loop add break;
                 Ok(_) => {
-                    match deserialize_register_command(&mut read_stream,
+                    match deserialize_register_command( read_stream,
                                                        &hmac_system_key, &hmac_client_key).await {
-                        Ok((cmd, bool)) => {
-
-                        }
-                        Err(_) => {}
+                        Ok((cmd, bool)) => { return cmd; }
+                        Err(_) => { todo!(); }
                     }
                 }
-            }*/
-        match deserialize_register_command(&mut read_stream,
-                                           &hmac_system_key, &hmac_client_key).await {
-            Ok((cmd, bool)) => { cmd }
-            Err(_) => { todo!() }
-        }
+            }
     }
 
     pub async fn handle_cmd(cmd: RegisterCommand) {
