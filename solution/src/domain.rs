@@ -39,6 +39,8 @@ pub struct PublicConfiguration {
 pub struct SectorVec(pub Vec<u8>);
 
 pub type SectorIdx = u64;
+pub type Timestamp_t = u64;
+pub type Rank_t = u8;
 
 #[derive(Debug, Clone)]
 pub enum RegisterCommand {
@@ -101,7 +103,7 @@ pub struct ClientCommandHeader {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SystemCommandHeader {
-    pub process_identifier: u8, // sent from
+    pub process_identifier: u8, // sent from, Rank_t
     pub msg_ident: Uuid,
     pub read_ident: u64,
     pub sector_idx: SectorIdx,

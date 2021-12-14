@@ -1,39 +1,83 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
+use tokio::io::AsyncReadExt;
 pub use crate::domain::*;
 mod domain;
 
-mod handle_cmd;
-use crate::handle_cmd::cmd::{get_cmd, handle_cmd};
-mod nnar;
+mod utils;
+mod atomic_register;
+mod register_client;
+mod sectors_manager;
+mod transfer;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 pub use stable_storage_public::*;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use tokio::net::TcpListener;
 pub use transfer_public::*;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+const REGISTER_COUNT: u32 = 512;
+
 
 pub async fn run_register_process(config: Configuration) {
+    println!("{} {}", usize::MAX, u8::MAX);
     let ident: u8 = config.public.self_rank;
     let (host, port) = &config.public.tcp_locations[(ident as usize) - 1];
     let tcp_listener: TcpListener = TcpListener::bind((host.as_str(), *port)).await.unwrap();
+
+    let (tx, rx) = unbounded_channel();
+    let rc = build_register_client(
+      ident, config.public.tcp_locations.clone(), tx, config.hmac_system_key).await;
+    let sm = build_sectors_manager(config.public.storage_dir.clone());
+
+    let txs = vec![];
+    let workers = vec![];
+    for i in 0..REGISTER_COUNT {
+        let path = config.public.storage_dir.clone().join(format!("worker_{}", i));
+        let ss = stable_storage_public::build_stable_storage(path).await;
+        let ar = build_atomic_register(
+            i+1,
+            ident,
+            ss,
+            rc.clone(),
+            sm.clone(),
+            config.public.tcp_locations.len()
+        ).await;
+        let (tx, rx): (UnboundedSender<RegisterCommand>, UnboundedReceiver<RegisterCommand>) = unbounded_channel();
+        txs.push(tx);
+        // worker reads from channel and invokes system_cmd/client_cmd of NNAR he owns
+        let worker = tokio::spawn(async move {
+            loop {
+                let cmd = rx.recv().await;
+                match cmd {
+                    Some(SystemRegisterCommand { header, content }) => {
+                        ar.system_command(SystemRegisterCommand { header, content });
+                    }
+                    Some(ClientRegisterCommand { header, content }) => {
+                        ar.client_command(ClientRegisterCommand { header, content });
+                    }
+                }
+            }
+        });
+        workers.push(worker);
+    }
+    // construct READER worker and WRITER worker
+
     loop {
         match tcp_listener.accept().await {
             Ok((tcp_stream, _)) => {
                 let (mut read_stream, mut write_stream) = tcp_stream.into_split();
-                    loop {
-                        let cmd = get_cmd(
-                            &mut read_stream,
-                            &mut write_stream, // todo maybe Arc
-                            config.hmac_system_key.clone(),
-                            config.hmac_client_key.clone(),
-                            config.public.max_sector,
-                        ).await;
-                        let res = handle_cmd(cmd).await;
-                    }
+                loop {
+                    let cmd = get_cmd(
+                        &mut read_stream,
+                        &mut write_stream, // todo maybe Arc
+                        config.hmac_system_key.clone(),
+                        config.hmac_client_key.clone(),
+                        config.public.max_sector,
+                    )
+                    .await;
+                    let _res = handle_cmd(cmd).await;
+                }
             }
             Err(e) => {
                 log::error!("Error while accepting connection on TcpListener: {:?}", e);
@@ -42,12 +86,35 @@ pub async fn run_register_process(config: Configuration) {
     }
 }
 
+pub async fn get_cmd(read_stream: &mut OwnedReadHalf, write_stream: &mut OwnedWriteHalf,
+                     hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], max_sector: u64) -> RegisterCommand {
+    let mut _buff: [u8; 1] = [0];
+    match read_stream.peek(&mut _buff).await {
+        Err(e) => {
+            log::error!("Error while peeking OwnedReadHalf of Tcp stream: {:?}", e);
+            panic!();
+        },
+        Ok(0) => {todo!()}, // no bytes to read     // if in loop add break;
+        Ok(_) => {
+            match deserialize_register_command( read_stream,
+                                                &hmac_system_key, &hmac_client_key).await {
+                Ok((cmd, bool)) => { return cmd; }
+                Err(_) => { todo!(); }
+            }
+        }
+    }
+}
+
+pub async fn handle_cmd(cmd: RegisterCommand) {
+
+}
+
 pub mod atomic_register_public {
+    use crate::atomic_register::atomic_register::Nnar;
     use crate::{
         ClientRegisterCommand, OperationComplete, RegisterClient, SectorsManager, StableStorage,
-        SystemRegisterCommand
+        SystemRegisterCommand,
     };
-    use crate::nnar::atomic_register::Nnar;
 
     use std::future::Future;
     use std::pin::Pin;
@@ -77,20 +144,31 @@ pub mod atomic_register_public {
     /// Communication with other processes of the system is to be done by register_client.
     /// And sectors must be stored in the sectors_manager instance.
     pub async fn build_atomic_register(
-        self_ident: u8,
+        self_identifier: u32,
+        process_identifier: u8,
         metadata: Box<dyn StableStorage>,
         register_client: Arc<dyn RegisterClient>,
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: usize,
     ) -> Box<dyn AtomicRegister> {
-        Nnar::new(self_ident, metadata, register_client, sectors_manager, processes_count).await
+        Nnar::new(
+            self_identifier,
+            process_identifier,
+            metadata,
+            register_client,
+            sectors_manager,
+            processes_count,
+        )
+        .await
     }
 }
 
 pub mod sectors_manager_public {
+
     use crate::{SectorIdx, SectorVec};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use crate::sectors_manager::sectors_manager::MySectorsManager;
 
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
@@ -108,25 +186,25 @@ pub mod sectors_manager_public {
 
     /// Path parameter points to a directory to which this method has exclusive access.
     pub fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        unimplemented!()
+        MySectorsManager::new(path)
     }
 }
 
 pub mod transfer_public {
-    use crate::handle_cmd::cmd;
-    use crate::handle_cmd::cmd::verify_hmac_tag;
+    use crate::transfer::transfer::{serialize_client_command, serialize_system_command,
+                                    deserialize_client_command, deserialize_system_command};
+
+    use crate::utils::utils;
     use crate::ClientRegisterCommandContent::Write;
     use crate::RegisterCommand::{Client, System};
-    use crate::{ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SectorVec, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, HMAC_TAG_SIZE, MAGIC_NUMBER, READ_MSG_T, READ_PROC_MSG_T, SECTOR_SIZE, VALUE_MSG_T, WRITE_MSG_T, WRITE_PROC_MSG_T, ACK_MSG_T};
-    use bytes::BufMut;
-    use log::{log, Level};
-    use serde::Serialize;
-    use std::any::Any;
-    use std::convert::TryInto;
-    use std::fs::rename;
+    use crate::{
+        RegisterCommand,
+
+        ACK_MSG_T, HMAC_TAG_SIZE, MAGIC_NUMBER, READ_MSG_T, READ_PROC_MSG_T,
+        VALUE_MSG_T, WRITE_PROC_MSG_T,
+    };
     use std::io::{Error, ErrorKind};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use uuid::Uuid;
 
     pub async fn serialize_register_command(
         cmd: &RegisterCommand,
@@ -136,96 +214,14 @@ pub mod transfer_public {
         let mut msg: Vec<u8> = Vec::with_capacity(3 * 8 + HMAC_TAG_SIZE);
         msg.append(&mut MAGIC_NUMBER.to_vec());
         match cmd {
-            Client(crc) => serialize_client_command(crc, writer, hmac_key, &mut msg).await,
-            System(src) => serialize_system_command(src, writer, hmac_key, &mut msg).await,
+            Client(crc) => serialize_client_command(crc, writer, &mut msg).await,
+            System(src) => serialize_system_command(src, writer, &mut msg).await,
         };
-        let tag = cmd::calculate_hmac_tag(&msg, hmac_key);
+        let tag = utils::calculate_hmac_tag(&msg, hmac_key);
         msg.append(&mut tag.to_vec());
         writer.write_all(&msg).await.unwrap();
         log::debug!("serialized msg length {:?}", msg.len());
         Ok(())
-    }
-
-    async fn serialize_client_command(
-        cmd: &ClientRegisterCommand,
-        writer: &mut (dyn AsyncWrite + Send + Unpin),
-        hmac_key: &[u8],
-        msg: &mut Vec<u8>,
-    ) {
-        log::debug!("serializing client command");
-        msg.append(&mut vec![0; 3]); // padding
-        let mut req_id = cmd.header.request_identifier.to_be_bytes().to_vec();
-        let mut sec_idx = cmd.header.sector_idx.to_be_bytes().to_vec();
-        match cmd.clone().content {
-            ClientRegisterCommandContent::Read => {
-                msg.push(READ_MSG_T);
-                msg.append(&mut req_id);
-                msg.append(&mut sec_idx);
-            }
-            ClientRegisterCommandContent::Write {
-                data: SectorVec(mut vec),
-            } => {
-                msg.push(WRITE_MSG_T);
-                msg.append(&mut req_id);
-                msg.append(&mut sec_idx);
-                msg.append(&mut vec);
-            }
-        };
-        log::debug!("msg {:?}", msg);
-    }
-
-    async fn serialize_system_command(
-        cmd: &SystemRegisterCommand,
-        writer: &mut (dyn AsyncWrite + Send + Unpin),
-        hmac_key: &[u8],
-        msg: &mut Vec<u8>
-    ) {
-        log::debug!("serializing system command");
-        msg.append(&mut [0_u8; 2].to_vec()); // padding
-        let mut rank = cmd.header.process_identifier.to_be_bytes().to_vec();
-        msg.append(&mut rank);
-        let mut uuid = cmd.header.msg_ident.as_bytes().to_vec();
-        let mut rid = cmd.header.read_ident .to_be_bytes().to_vec();
-        let mut sec_idx = cmd.header.sector_idx.to_be_bytes().to_vec();
-        match cmd.clone().content {
-            SystemRegisterCommandContent::ReadProc => {
-                msg.push(READ_PROC_MSG_T);
-                msg.append(&mut uuid);
-                msg.append(&mut rid);
-                msg.append(&mut sec_idx);
-            }
-            SystemRegisterCommandContent::Value {
-                timestamp, write_rank, sector_data: SectorVec(mut data)
-            } => {
-                msg.push(VALUE_MSG_T);
-                msg.append(&mut uuid);
-                msg.append(&mut rid);
-                msg.append(&mut sec_idx);
-                msg.append(&mut timestamp.to_be_bytes().to_vec());
-                msg.append(&mut [0, 7].to_vec()); // padding
-                msg.push(write_rank);
-                msg.append(&mut data);
-            },
-            SystemRegisterCommandContent::WriteProc {
-                timestamp, write_rank, data_to_write: SectorVec(mut data)
-            } => {
-                msg.push(WRITE_PROC_MSG_T);
-                msg.append(&mut uuid);
-                msg.append(&mut rid);
-                msg.append(&mut sec_idx);
-                msg.append(&mut timestamp.to_be_bytes().to_vec());
-                msg.append(&mut [0; 7].to_vec()); // padding
-                msg.push(write_rank);
-                msg.append(&mut data);
-            },
-            SystemRegisterCommandContent::Ack => {
-                msg.push(ACK_MSG_T);
-                msg.append(&mut uuid);
-                msg.append(&mut rid);
-                msg.append(&mut sec_idx);
-            }
-        };
-        log::debug!("msg {:?}", msg);
     }
 
     pub async fn deserialize_register_command(
@@ -275,103 +271,8 @@ pub mod transfer_public {
         };
         let mut tag_buffer: [u8; HMAC_TAG_SIZE] = [0; HMAC_TAG_SIZE];
         data.read_exact(&mut tag_buffer).await.unwrap();
-        let verified = cmd::verify_hmac_tag(&tag_buffer, &msg, key);
+        let verified = utils::verify_hmac_tag(&tag_buffer, &msg, key);
         Ok((cmd, verified))
-    }
-
-    async fn deserialize_client_command(
-        data: &mut (dyn AsyncRead + Send + Unpin),
-        msg_type: u8,
-        hmac_key: &[u8; 32],
-        msg: &mut Vec<u8>,
-    ) -> RegisterCommand {
-        let mut buffer: [u8; 16] = [0; 16];
-        data.read_exact(&mut buffer).await.unwrap();
-        msg.append(&mut buffer.to_vec());
-        let req_no: u64 = u64::from_be_bytes(buffer[..8].try_into().unwrap());
-        let sec_idx: u64 = u64::from_be_bytes(buffer[8..].try_into().unwrap());
-
-        let header = ClientCommandHeader {
-            request_identifier: req_no,
-            sector_idx: sec_idx,
-        };
-        let content = match msg_type {
-            0x01 => ClientRegisterCommandContent::Read,
-            0x02 => {
-                let mut content_buffer: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
-                data.read_exact(&mut content_buffer).await.unwrap();
-                msg.append(&mut content_buffer.to_vec());
-                ClientRegisterCommandContent::Write {
-                    data: SectorVec(Vec::from(content_buffer)),
-                }
-            }
-            _ => {
-                log::error!("Bug in deserialize_client_command. unknown msg_type should already be handled in deserialize_register_command");
-                panic!();
-            }
-        };
-        RegisterCommand::Client(ClientRegisterCommand { header, content })
-    }
-
-    async fn deserialize_system_command(
-        data: &mut (dyn AsyncRead + Send + Unpin),
-        rank: u8,
-        msg_type: u8,
-        hmac_system_key: &[u8; 64],
-        msg: &mut Vec<u8>,
-    ) -> RegisterCommand {
-        let mut buffer: [u8; 32] = [0; 32];
-        data.read_exact(&mut buffer).await.unwrap();
-        msg.append(&mut buffer.to_vec());
-        let uuid = Uuid::from_bytes(buffer[..16].try_into().unwrap());
-        let rid_rop = u64::from_be_bytes(buffer[16..24].try_into().unwrap());
-        let sec_idx = u64::from_be_bytes(buffer[24..].try_into().unwrap());
-        let header = SystemCommandHeader {
-            process_identifier: rank,
-            msg_ident: uuid,
-            read_ident: rid_rop,
-            sector_idx: sec_idx,
-        };
-        let content = match msg_type {
-            0x03 => SystemRegisterCommandContent::ReadProc,
-            0x04 => {
-                let mut buffer: [u8; 16 + SECTOR_SIZE] = [0; 16 + SECTOR_SIZE];
-                data.read_exact(&mut buffer).await.unwrap();
-                msg.append(&mut buffer.to_vec());
-                let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
-                // padding = buffer[8..15]
-                let write_rank = buffer[15];
-                let sec_data = SectorVec(buffer[16..].to_vec());
-                SystemRegisterCommandContent::Value {
-                    timestamp,
-                    write_rank,
-                    sector_data: sec_data,
-                }
-            }
-            0x05 => {
-                let mut buffer: [u8; 16 + SECTOR_SIZE] = [0; 16 + SECTOR_SIZE];
-                data.read_exact(&mut buffer).await.unwrap();
-                msg.append(&mut buffer.to_vec());
-                let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
-                // padding = buffer[8..15]
-                let write_rank = buffer[15];
-                let sec_data = SectorVec(buffer[16..].to_vec());
-                SystemRegisterCommandContent::WriteProc {
-                    timestamp,
-                    write_rank,
-                    data_to_write: sec_data
-                }
-            },
-            0x06 => SystemRegisterCommandContent::Ack,
-            _ => {
-                log::error!("Bug in deserialize_client_command. unknown msg_type should already be handled in deserialize_register_command");
-                panic!();
-            }
-        };
-        System(SystemRegisterCommand{
-            header,
-            content
-        })
     }
 
 
@@ -380,6 +281,11 @@ pub mod transfer_public {
 pub mod register_client_public {
     use crate::SystemRegisterCommand;
     use std::sync::Arc;
+    use crate::register_client::register_client::Sbeb;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+    use std::collections::HashMap;
 
     #[async_trait::async_trait]
     /// We do not need any public implementation of this trait. It is there for use
@@ -401,6 +307,13 @@ pub mod register_client_public {
         pub cmd: Arc<SystemRegisterCommand>,
         /// Identifier of the target process. Those start at 1.
         pub target: usize,
+    }
+
+    pub async fn build_register_client(ident: u8,
+                                       tcp_locations: Vec<(String, u16)>,
+                                       sender: UnboundedSender<SystemRegisterCommand>,
+                                       hmac_system_key: [u8; 64],) -> Arc<dyn RegisterClient> {
+        Arc::new(Sbeb::new(ident, tcp_locations, sender, hmac_system_key))
     }
 }
 

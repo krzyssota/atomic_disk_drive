@@ -3,14 +3,12 @@ pub mod atomic_register {
     use crate::ClientRegisterCommandContent::{Read, Write};
     use crate::SystemRegisterCommandContent::{Ack, ReadProc, Value, WriteProc};
     use crate::{
-        AtomicRegister, Broadcast, ClientCommandHeader, ClientRegisterCommand, OperationComplete,
+        AtomicRegister, Broadcast, ClientRegisterCommand, OperationComplete,
         OperationReturn, ReadReturn, RegisterClient, SectorIdx, SectorVec, SectorsManager,
         StableStorage, StatusCode, SystemCommandHeader, SystemRegisterCommand,
         SystemRegisterCommandContent,
     };
-    use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
-    use std::fmt::format;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -23,7 +21,8 @@ pub mod atomic_register {
         data: SectorVec
     }
     pub struct Nnar {
-        self_identifier: u8,
+        self_identifier: u32,
+        process_identifier: u8,
         read_ident: u64,
         readlist: HashMap<u8, (u64, u8, SectorVec)>, // readlist[self] := (timestamp, write_rank, val);
         acklist: HashSet<u8>,                        // acklist[q] := Ack;
@@ -44,12 +43,12 @@ pub mod atomic_register {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: usize,
     }
-    const RECOVERY_KEY: &str = "recovery";
     const RID_KEY: &str = "rid";
 
     impl Nnar {
         pub async fn new(
-            self_ident: u8,
+            self_identifier: u32,
+            process_identifier: u8,
             metadata: Box<dyn StableStorage>,
             register_client: Arc<dyn RegisterClient>,
             sectors_manager: Arc<dyn SectorsManager>,
@@ -57,7 +56,8 @@ pub mod atomic_register {
         ) -> Box<dyn AtomicRegister> {
             //let (ts, wr, data) = sectors_manager.read_metadata(); // this needs particular secor
             Box::new(Nnar {
-                self_identifier: self_ident,
+                self_identifier,
+                process_identifier,
                 read_ident: 0,
                 readlist: HashMap::new(),
                 acklist: HashSet::new(),
@@ -124,7 +124,7 @@ pub mod atomic_register {
             self.acklist.clear();
             self.readlist.clear();
             self.stable_storage
-                .put(RID_KEY, &bincode::serialize(&self.read_ident).unwrap());
+                .put(RID_KEY, &bincode::serialize(&self.read_ident).unwrap()).await.unwrap();
             match cmd.content {
                 Read => {
                     self.reading = true;
@@ -141,7 +141,7 @@ pub mod atomic_register {
             let broadcast = Broadcast {
                 cmd: Arc::new(SystemRegisterCommand {
                     header: SystemCommandHeader {
-                        process_identifier: self.self_identifier,
+                        process_identifier: self.process_identifier, // TODO czy to jest dobrze
                         msg_ident: Uuid::from_bytes(
                             (cmd.header.request_identifier as u128).to_ne_bytes(),
                         ),
@@ -151,13 +151,13 @@ pub mod atomic_register {
                     content: SystemRegisterCommandContent::ReadProc,
                 }),
             };
-            self.sbeb.broadcast(broadcast);
+            self.sbeb.broadcast(broadcast).await;
         }
 
         /// Send system command to the register.
         async fn system_command(&mut self, cmd: SystemRegisterCommand) {
             let header = SystemCommandHeader {
-                process_identifier: self.self_identifier,
+                process_identifier: self.process_identifier,
                 msg_ident: Uuid::from_bytes((cmd.header.process_identifier as u128).to_ne_bytes()),
                 read_ident: self.read_ident,
                 sector_idx: cmd.header.sector_idx,
@@ -180,13 +180,13 @@ pub mod atomic_register {
                     self.sbeb.send(crate::Send {
                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                         target: sender as usize,
-                    });
+                    }).await;
                 } /*
              upon event <sl, Deliver | q, [VALUE, r, ts', wr', v'] > such that r == rid and !write_phase do // od q otrzymalem jego timestamp, write_rank i wartość; wlaściwe parsowanie dla N/2 takiej wiadomosci. wczesniej tylko odnotowuje, póżniej ignoruje
                 readlist[q] := (ts', wr', v');
                 if #(readlist) > N / 2 and (reading or writing) then
                     readlist[self] := (ts, wr, val);
-                    (maxts, rr, readval) := highest(readlist); // najwyższy (ts, rank) i powiązana z nim wartość
+                    (maxts, rr, readval) := highest(retaadlist); // najwyższy (ts, rank) i powiązana z nim wartość
                     readlist := [ _ ] `of length` N;
                     acklist := [ _ ] `of length` N;
                     write_phase := TRUE;
@@ -225,7 +225,7 @@ pub mod atomic_register {
                                 };
                                 self.sbeb.broadcast(Broadcast {
                                     cmd: Arc::new(SystemRegisterCommand { header, content }),
-                                });
+                                }).await;
                             } else {
                                 let ts = maxts + 1;
                                 let wr = self.self_identifier;
@@ -233,7 +233,7 @@ pub mod atomic_register {
                                     let writeval_cloned = writeval.clone();
                                     let sec_idx = writeval.sector_idx;
                                     let data = writeval.data;
-                                    self.sectors_manager.write(sec_idx, &(data.clone(), ts, wr)); // todo zastanowić się gdzie trzymac request_identifier
+                                    self.sectors_manager.write(sec_idx, &(data.clone(), ts, wr)).await; // todo zastanowić się gdzie trzymac request_identifier
                                     let content = WriteProc {
                                         timestamp: ts,
                                         write_rank: self.self_identifier,
@@ -241,9 +241,9 @@ pub mod atomic_register {
                                     };
                                     self.sbeb.broadcast(Broadcast {
                                         cmd: Arc::new(SystemRegisterCommand { header, content }),
-                                    });
+                                    }).await;
                                 } else {
-                                    panic!("writaval = None w nnar.rs 251 system_command handling Value")
+                                    panic!("writaval = None w atomic_register 251 system_command handling Value")
                                 }
                             }
                         }
@@ -268,9 +268,9 @@ pub mod atomic_register {
                         if let Some(writeval) = self.writeval.clone() {
                             let sec_idx = writeval.sector_idx;
                             let data = writeval.data;
-                            self.sectors_manager.write(sec_idx, &(data, ts, wr));
+                            self.sectors_manager.write(sec_idx, &(data, ts, wr)).await;
                         } else {
-                            panic!("writaval = None w nnar.rs 264 system_command handling Value")
+                            panic!("writaval = None w atomic_register 264 system_command handling Value")
                         }
                     }
                     let content = Ack;
@@ -278,7 +278,7 @@ pub mod atomic_register {
                     self.sbeb.send(crate::Send {
                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                         target: sender as usize,
-                    });
+                    }).await;
                 }
                 /*
                 upon event < sl, Deliver | q, [ACK, r] > such that r == rid and write_phase do // dostałem ack czyli ktoś sb zapisał to co mu wyslalem
@@ -305,7 +305,7 @@ pub mod atomic_register {
                                     (readval.request_identifier,
                                     OperationReturn::Read(ReadReturn { read_data: Some(readval.data) }))
                                 } else {
-                                    panic!("readval = None w nnar.rs 308 system_command handling Ack")
+                                    panic!("readval = None w atomic_register 308 system_command handling Ack")
                                 }
                             } else {
                               self.writing = false;
@@ -313,7 +313,7 @@ pub mod atomic_register {
                                     (writeval.request_identifier,
                                      OperationReturn::Write)
                                 } else {
-                                    panic!("writaval = None w nnar.rs 308 system_command handling Ack")
+                                    panic!("writaval = None w atomic_register 308 system_command handling Ack")
                                 }
                             };
                             if let Some(_) = self.callback {
@@ -321,7 +321,7 @@ pub mod atomic_register {
                                     status_code: StatusCode::Ok,
                                     request_identifier,
                                     op_return
-                                });
+                                }).await;
                             }
                            /* if let Some(callback) = self.callback {
                                 callback(OperationComplete{
@@ -338,45 +338,3 @@ pub mod atomic_register {
         }
     }
 }
-
-/*
-// od p-tego procesu READ_PROC z jego read_ident
-upon event < sbeb, Deliver | p [READ_PROC, r] > do
-// VALUE na prośbę p-tego z jego read_ident i z moimi ts,write_rank (rank tego kto zapisał,val
-trigger < sl, Send | p, [VALUE, r, ts, wr, val] >;
-
-//
-upon event <sl, Deliver | q, [VALUE, r, ts', wr', v'] > such that r == rid and !write_phase do
-readlist[q] := (ts', wr', v');
-if #(readlist) > N / 2 and (reading or writing) then
-  readlist[self] := (ts, wr, val);
-  (maxts, rr, readval) := highest(readlist);
-  readlist := [ _ ] `of length` N;
-  acklist := [ _ ] `of length` N;
-  write_phase := TRUE;
-  if reading = TRUE then
-      trigger < sbeb, Broadcast | [WRITE_PROC, rid, maxts, rr, readval] >;
-  else
-      (ts, wr, val) := (maxts + 1, rank(self), writeval);
-      store(ts, wr, val);
-      trigger < sbeb, Broadcast | [WRITE_PROC, rid, maxts + 1, rank(self), writeval] >;
-
-
-upon event < sbeb, Deliver | p, [WRITE_PROC, r, ts', wr', v'] > do
-if (ts', wr') > (ts, wr) then
-  (ts, wr, val) := (ts', wr', v');
-  store(ts, wr, val);
-trigger < sl, Send | p, [ACK, r] >;
-
-upon event < sl, Deliver | q, [ACK, r] > such that r == rid and write_phase do
-acklist[q] := Ack;
-if #(acklist) > N / 2 and (reading or writing) then
-  acklist := [ _ ] `of length` N;
-  write_phase := FALSE;
-  if reading = TRUE then
-      reading := FALSE;
-      trigger < nnar, ReadReturn | readval >;
-  else
-      writing := FALSE;
-      trigger < nnar, WriteReturn >;
-      */
