@@ -127,20 +127,6 @@ pub struct ReadReturn {
     pub read_data: Option<SectorVec>,
 }
 
-/*
-impl From<u8> for RegisterCommandType {
-    fn from(b: u8) -> Self {
-        match b {
-            1 => RegisterCommandType::READ,
-            2 => RegisterCommandType::WRITE,
-            3 => RegisterCommandType::READ_PROC,
-            4 => RegisterCommandType::VALUE,
-            5 => RegisterCommandType::WRITE_PROC,
-            6 => RegisterCommandType::ACK,
-            _ => {}
-        }
-    }
-}*/
 
 
 

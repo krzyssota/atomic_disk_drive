@@ -21,7 +21,7 @@ pub mod atomic_register {
         data: SectorVec
     }
     pub struct Nnar {
-        self_identifier: u32,
+        self_identifier: u8,
         process_identifier: u8,
         read_ident: u64,
         readlist: HashMap<u8, (u64, u8, SectorVec)>, // readlist[self] := (timestamp, write_rank, val);
@@ -47,8 +47,7 @@ pub mod atomic_register {
 
     impl Nnar {
         pub async fn new(
-            self_identifier: u32,
-            process_identifier: u8,
+            self_identifier: u8,
             metadata: Box<dyn StableStorage>,
             register_client: Arc<dyn RegisterClient>,
             sectors_manager: Arc<dyn SectorsManager>,
@@ -57,7 +56,7 @@ pub mod atomic_register {
             //let (ts, wr, data) = sectors_manager.read_metadata(); // this needs particular secor
             Box::new(Nnar {
                 self_identifier,
-                process_identifier,
+                process_identifier: 42, // TODO skad to wziac? może niepotrzebne?
                 read_ident: 0,
                 readlist: HashMap::new(),
                 acklist: HashSet::new(),

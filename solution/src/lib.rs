@@ -1,83 +1,85 @@
-use tokio::io::AsyncReadExt;
 pub use crate::domain::*;
+use std::collections::{HashMap, HashSet};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 mod domain;
 
-mod utils;
 mod atomic_register;
 mod register_client;
 mod sectors_manager;
 mod transfer;
+mod utils;
+use crate::RegisterCommand::{Client, System};
+use crate::SystemRegisterCommandContent::{Ack, Value};
+use async_channel::{unbounded, Receiver, Sender};
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 pub use stable_storage_public::*;
+use std::sync::{Arc, RwLock};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
 pub use transfer_public::*;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use uuid::Uuid;
 
-const REGISTER_COUNT: u32 = 512;
-
+const REGISTER_COUNT: u8 = u8::MAX;
 
 pub async fn run_register_process(config: Configuration) {
-    println!("{} {}", usize::MAX, u8::MAX);
     let ident: u8 = config.public.self_rank;
+    let processes_count = config.public.tcp_locations.len();
     let (host, port) = &config.public.tcp_locations[(ident as usize) - 1];
     let tcp_listener: TcpListener = TcpListener::bind((host.as_str(), *port)).await.unwrap();
 
-    let (tx, rx) = unbounded_channel();
+    let (loopback_sender, loopback_receiver) = unbounded();
+    let (op_comp_sender, op_comp_receiver) = unbounded();
+
+    let broadcast_pool = Arc::new(RwLock::new(HashMap::new()));
     let rc = build_register_client(
-      ident, config.public.tcp_locations.clone(), tx, config.hmac_system_key).await;
+        ident,
+        config.public.tcp_locations.clone(),
+        loopback_sender,
+        config.hmac_system_key,
+        broadcast_pool.clone(),
+    )
+    .await;
     let sm = build_sectors_manager(config.public.storage_dir.clone());
 
-    let txs = vec![];
-    let workers = vec![];
+    let mut cmd_senders = vec![];
+
     for i in 0..REGISTER_COUNT {
-        let path = config.public.storage_dir.clone().join(format!("worker_{}", i));
+        let path = config
+            .public
+            .storage_dir
+            .clone()
+            .join(format!("worker_{}", i));
         let ss = stable_storage_public::build_stable_storage(path).await;
-        let ar = build_atomic_register(
-            i+1,
-            ident,
-            ss,
-            rc.clone(),
-            sm.clone(),
-            config.public.tcp_locations.len()
-        ).await;
-        let (tx, rx): (UnboundedSender<RegisterCommand>, UnboundedReceiver<RegisterCommand>) = unbounded_channel();
-        txs.push(tx);
-        // worker reads from channel and invokes system_cmd/client_cmd of NNAR he owns
-        let worker = tokio::spawn(async move {
-            loop {
-                let cmd = rx.recv().await;
-                match cmd {
-                    Some(SystemRegisterCommand { header, content }) => {
-                        ar.system_command(SystemRegisterCommand { header, content });
-                    }
-                    Some(ClientRegisterCommand { header, content }) => {
-                        ar.client_command(ClientRegisterCommand { header, content });
-                    }
-                }
-            }
-        });
-        workers.push(worker);
+        let mut ar =
+            build_atomic_register(i + 1, ss, rc.clone(), sm.clone(), processes_count).await;
+        let (cmd_sender, cmd_receiver): (Sender<RegisterCommand>, Receiver<RegisterCommand>) =
+            unbounded();
+
+        cmd_senders.push(cmd_sender);
+
+        let op_comp_sender_clone = op_comp_sender.clone();
+        tokio::spawn(worker_loop(op_comp_sender_clone, cmd_receiver, ar, i));
     }
-    // construct READER worker and WRITER worker
 
     loop {
         match tcp_listener.accept().await {
             Ok((tcp_stream, _)) => {
-                let (mut read_stream, mut write_stream) = tcp_stream.into_split();
-                loop {
-                    let cmd = get_cmd(
-                        &mut read_stream,
-                        &mut write_stream, // todo maybe Arc
-                        config.hmac_system_key.clone(),
-                        config.hmac_client_key.clone(),
-                        config.public.max_sector,
-                    )
-                    .await;
-                    let _res = handle_cmd(cmd).await;
-                }
+                let (mut read_stream, write_stream) = tcp_stream.into_split();
+                tokio::spawn(send_response(op_comp_receiver.clone(), write_stream));
+                // receive self cmd
+                tokio::spawn(read_from_loopback(
+                    loopback_receiver.clone(),
+                    cmd_senders.clone(),
+                    broadcast_pool.clone(),
+                    processes_count as u8,
+                ));
+                // receive cmd from client or another process
+                tokio::spawn(read_from_tcp(read_stream,
+                                           config.hmac_system_key.clone(),config.hmac_client_key.clone(),
+                                           cmd_senders.clone(),broadcast_pool.clone(),
+                processes_count as u8));
             }
             Err(e) => {
                 log::error!("Error while accepting connection on TcpListener: {:?}", e);
@@ -86,27 +88,145 @@ pub async fn run_register_process(config: Configuration) {
     }
 }
 
-pub async fn get_cmd(read_stream: &mut OwnedReadHalf, write_stream: &mut OwnedWriteHalf,
-                     hmac_system_key: [u8; 64], hmac_client_key: [u8; 32], max_sector: u64) -> RegisterCommand {
-    let mut _buff: [u8; 1] = [0];
-    match read_stream.peek(&mut _buff).await {
-        Err(e) => {
-            log::error!("Error while peeking OwnedReadHalf of Tcp stream: {:?}", e);
-            panic!();
-        },
-        Ok(0) => {todo!()}, // no bytes to read     // if in loop add break;
-        Ok(_) => {
-            match deserialize_register_command( read_stream,
-                                                &hmac_system_key, &hmac_client_key).await {
-                Ok((cmd, bool)) => { return cmd; }
-                Err(_) => { todo!(); }
+async fn read_from_tcp(mut read_stream: OwnedReadHalf, system_key:  [u8; 64], client_key: [u8; 32],
+    cmd_senders: Vec<Sender<RegisterCommand>>, broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
+                       processes_count: u8,)  {
+    loop {
+        match deserialize_register_command(
+            &mut read_stream,
+            &system_key,
+            &client_key,
+        )
+        .await
+        {
+            Ok((cmd, correct)) => {
+                if correct {
+                    delegate_cmd(
+                        &cmd_senders,
+                        cmd,
+                        broadcast_pool.clone(),
+                        processes_count as u8,
+                    )
+                    .await;
+                } else {
+                    todo!(); // TODO handle msg with incorrect type
+                }
+            }
+            Err(e) => {
+                log::error!("reader worker, deserialize error: {:?}", e);
+            }
+        }
+    }
+}
+async fn read_from_loopback(
+    loopback_receiver: Receiver<SystemRegisterCommand>,
+    cmd_senders: Vec<Sender<RegisterCommand>>,
+    broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
+    processes_count: u8,
+) {
+    loop {
+        match loopback_receiver.recv().await {
+            Ok(cmd) => {
+                delegate_cmd(
+                    &cmd_senders,
+                    RegisterCommand::System(cmd),
+                    broadcast_pool.clone(),
+                    processes_count,
+                )
+                .await;
+            }
+            Err(e) => {
+                log::error!("writer worker, recvError: {:?}", e);
             }
         }
     }
 }
 
-pub async fn handle_cmd(cmd: RegisterCommand) {
+pub async fn delegate_cmd(
+    cmd_senders: &Vec<Sender<RegisterCommand>>,
+    cmd: RegisterCommand,
+    broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
+    processes_count: u8,
+) {
+    let mut sec_idx = 1;
+    // adjust broadcasting_pool
+    match cmd.clone() {
+        Client(ClientRegisterCommand { header, content }) => {
+            let mut map = broadcast_pool.write().unwrap();
+            //HashSet::from([1..processes_count]),
+            let set = (1..processes_count).collect();
+            map.insert(Uuid::from_u128(header.request_identifier as u128), set);
+            sec_idx = header.sector_idx;
+        }
+        System(SystemRegisterCommand { header, content }) => {
+            match content {
+                (SystemRegisterCommandContent::Value { .. })
+                | SystemRegisterCommandContent::Ack => {
+                    let mut map = broadcast_pool.write().unwrap();
+                    let set: &mut HashSet<u8> = map.get_mut(&header.msg_ident).unwrap(); // TODO handle instead of unwrap
+                    set.remove(&header.process_identifier);
+                    if set.is_empty() {
+                        (*map).remove(&header.msg_ident).unwrap();
+                    }
+                }
+                _ => {}
+            }
+            sec_idx = header.sector_idx;
+        }
+    };
+    let sender = &cmd_senders[(sec_idx % REGISTER_COUNT as u64) as usize];
+    sender.send(cmd);
+}
 
+async fn worker_loop(
+    op_comp_sender: Sender<OperationComplete>,
+    cmd_receiver: Receiver<RegisterCommand>,
+    mut ar: Box<dyn AtomicRegister>,
+    i: u8,
+) {
+    loop {
+        match cmd_receiver.recv().await {
+            Ok(System(src)) => {
+                ar.as_mut().system_command(src);
+            }
+            Ok(Client(crc)) => {
+                let op_comp_sender_clone = op_comp_sender.clone();
+                let callback: Box<
+                    dyn FnOnce(
+                            OperationComplete,
+                        ) -> core::pin::Pin<
+                            Box<dyn core::future::Future<Output = ()> + core::marker::Send>,
+                        > + core::marker::Send
+                        + Sync,
+                > = Box::new(move |op_c| {
+                    tokio::spawn(async move {
+                        op_comp_sender_clone.send(op_c).await;
+                    });
+                    todo!(); // ^ this should be enough but types dont match
+                });
+                ar.as_mut().client_command(crc, callback);
+            }
+            Err(e) => {
+                log::error!("worker: {:?}, recvError: {:?}", i + 1, e);
+            }
+        }
+    }
+}
+
+async fn send_response(
+    op_comp_receiver: Receiver<OperationComplete>,
+    write_stream: OwnedWriteHalf,
+) {
+    match op_comp_receiver.recv().await {
+        Ok(op_complete) => {
+            let mut data: &[u8] = todo!(); // TODO write response on write_stream
+            write_stream.write_all(data);
+            todo!();
+        }
+        Err(e) => {
+            log::error!("response worker, recvError: {:?}", e);
+        }
+    }
 }
 
 pub mod atomic_register_public {
@@ -144,16 +264,14 @@ pub mod atomic_register_public {
     /// Communication with other processes of the system is to be done by register_client.
     /// And sectors must be stored in the sectors_manager instance.
     pub async fn build_atomic_register(
-        self_identifier: u32,
-        process_identifier: u8,
+        self_ident: u8,
         metadata: Box<dyn StableStorage>,
         register_client: Arc<dyn RegisterClient>,
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: usize,
     ) -> Box<dyn AtomicRegister> {
         Nnar::new(
-            self_identifier,
-            process_identifier,
+            self_ident,
             metadata,
             register_client,
             sectors_manager,
@@ -161,14 +279,15 @@ pub mod atomic_register_public {
         )
         .await
     }
+    // TODO sprawdzić zgonośc sygnatur z oryginałem
 }
 
 pub mod sectors_manager_public {
 
+    use crate::sectors_manager::sectors_manager::MySectorsManager;
     use crate::{SectorIdx, SectorVec};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use crate::sectors_manager::sectors_manager::MySectorsManager;
 
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
@@ -191,16 +310,16 @@ pub mod sectors_manager_public {
 }
 
 pub mod transfer_public {
-    use crate::transfer::transfer::{serialize_client_command, serialize_system_command,
-                                    deserialize_client_command, deserialize_system_command};
+    use crate::transfer::transfer::{
+        deserialize_client_command, deserialize_system_command, serialize_client_command,
+        serialize_system_command,
+    };
 
     use crate::utils::utils;
     use crate::ClientRegisterCommandContent::Write;
     use crate::RegisterCommand::{Client, System};
     use crate::{
-        RegisterCommand,
-
-        ACK_MSG_T, HMAC_TAG_SIZE, MAGIC_NUMBER, READ_MSG_T, READ_PROC_MSG_T,
+        RegisterCommand, ACK_MSG_T, HMAC_TAG_SIZE, MAGIC_NUMBER, READ_MSG_T, READ_PROC_MSG_T,
         VALUE_MSG_T, WRITE_PROC_MSG_T,
     };
     use std::io::{Error, ErrorKind};
@@ -274,18 +393,16 @@ pub mod transfer_public {
         let verified = utils::verify_hmac_tag(&tag_buffer, &msg, key);
         Ok((cmd, verified))
     }
-
-
 }
 
 pub mod register_client_public {
+    use crate::register_client::register_client::Stubborn;
     use crate::SystemRegisterCommand;
-    use std::sync::Arc;
-    use crate::register_client::register_client::Sbeb;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, RwLock};
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::Mutex;
     use uuid::Uuid;
-    use std::collections::HashMap;
 
     #[async_trait::async_trait]
     /// We do not need any public implementation of this trait. It is there for use
@@ -309,11 +426,20 @@ pub mod register_client_public {
         pub target: usize,
     }
 
-    pub async fn build_register_client(ident: u8,
-                                       tcp_locations: Vec<(String, u16)>,
-                                       sender: UnboundedSender<SystemRegisterCommand>,
-                                       hmac_system_key: [u8; 64],) -> Arc<dyn RegisterClient> {
-        Arc::new(Sbeb::new(ident, tcp_locations, sender, hmac_system_key))
+    pub async fn build_register_client(
+        ident: u8,
+        tcp_locations: Vec<(String, u16)>,
+        sender: async_channel::Sender<SystemRegisterCommand>,
+        hmac_system_key: [u8; 64],
+        broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
+    ) -> Arc<dyn RegisterClient> {
+        Arc::new(Stubborn::new(
+            ident,
+            tcp_locations,
+            sender,
+            hmac_system_key,
+            broadcast_pool,
+        ))
     }
 }
 

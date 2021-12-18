@@ -1,52 +1,55 @@
 pub mod register_client {
     use crate::{Broadcast, RegisterClient, RegisterCommand, serialize_register_command, SystemRegisterCommand};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use tokio::net::TcpStream;
-    use tokio::sync::mpsc::UnboundedSender;
+    use async_channel::{Sender, Receiver};
     use uuid::Uuid;
-    use std::sync::{Arc};
+    use std::sync::{Arc, RwLock};
     use tokio::sync::Mutex;
     use tokio::io::AsyncWriteExt;
 
-    pub struct Sbeb {
+    pub struct Stubborn {
         self_identifier: u8,
         tcp_streams: Vec<Arc<Mutex<Option<TcpStream>>>>, // TODO bez Arc jesli mutex tokio
         tcp_locations: Vec<(String, u16)>,
-        loopback: UnboundedSender<SystemRegisterCommand>,
+        loopback: Sender<SystemRegisterCommand>,
         buffered_msgs: Mutex<HashMap<Uuid, SystemRegisterCommand>>,
         hmac_system_key: [u8; 64],
+        broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>
     }
 
-    impl Sbeb {
+    impl Stubborn {
         pub fn new(
             ident: u8,
             tcp_locations: Vec<(String, u16)>,
-            sender: UnboundedSender<SystemRegisterCommand>,
+            sender: Sender<SystemRegisterCommand>,
             hmac_system_key: [u8; 64],
+            broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>
         ) -> Self {
             let mut tcp_streams = Vec::with_capacity(tcp_locations.len());
             for _ in 0..tcp_locations.len() {
                 tcp_streams.push(Arc::new(Mutex::new(None)));
             }
-            Sbeb {
+            Stubborn {
                 self_identifier: ident,
                 tcp_streams,
                 tcp_locations,
                 loopback: sender,
                 buffered_msgs: Mutex::new(HashMap::new()),
                 hmac_system_key,
+                broadcast_pool,
             }
         }
     }
 
     #[async_trait::async_trait]
-    impl RegisterClient for Sbeb {
+    impl RegisterClient for Stubborn {
         async fn send(&self, msg: crate::Send) {
             let header = msg.cmd.header.clone();
             let content = msg.cmd.content.clone();
             let target = msg.target;
             if target == (self.self_identifier as usize) {
-                if let Err(e) = self.loopback.send(SystemRegisterCommand{header, content}) {
+                if let Err(e) = self.loopback.send(SystemRegisterCommand{header, content}).await {
                     log::error!("reg_client:{}, loopback error {}", self.self_identifier, e);
                 }
             } else {
