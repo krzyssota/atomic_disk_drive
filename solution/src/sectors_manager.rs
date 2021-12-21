@@ -1,5 +1,5 @@
 pub mod sectors_manager {
-    use crate::{Rank_t, Timestamp_t, SectorIdx, SectorVec, SectorsManager};
+    use crate::{RankT, TimestampT, SectorIdx, SectorVec, SectorsManager};
     use std::collections::HashMap;
     use std::path::{PathBuf};
     use std::sync::{Arc};
@@ -13,8 +13,8 @@ pub mod sectors_manager {
     }
 
     pub struct Metadata {
-        ts: Timestamp_t,
-        wr: Rank_t
+        ts: TimestampT,
+        wr: RankT
     }
 
     impl MySectorsManager {
@@ -80,7 +80,7 @@ pub mod sectors_manager {
             }
         }
 
-        async fn read_metadata(&self, idx: SectorIdx) -> (Timestamp_t, Rank_t) {
+        async fn read_metadata(&self, idx: SectorIdx) -> (TimestampT, RankT) {
             let meta = self.cashed_metadata.read().await;
             if let Some((_, Metadata{ts, wr})) = (*meta).get(&idx) {
                 (*ts, *wr)
@@ -90,7 +90,7 @@ pub mod sectors_manager {
             }
         }
 
-        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, Timestamp_t, Rank_t)) {
+        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, TimestampT, RankT)) {
             let (SectorVec(data), ts, wr) = sector;
 
             let mut tmp_path = self.dir.clone().join(format!("tmp_{}_{}_{}", idx, ts, wr));

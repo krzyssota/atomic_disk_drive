@@ -22,7 +22,6 @@ pub mod atomic_register {
     }
     pub struct Nnar {
         self_identifier: u8,
-        process_identifier: u8,
         read_ident: u64,
         readlist: HashMap<u8, (u64, u8, SectorVec)>, // readlist[self] := (timestamp, write_rank, val);
         acklist: HashSet<u8>,                        // acklist[q] := Ack;
@@ -39,7 +38,7 @@ pub mod atomic_register {
             >,
         >,
         stable_storage: Box<dyn StableStorage>,
-        sbeb: Arc<dyn RegisterClient>,
+        register_client: Arc<dyn RegisterClient>,
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: usize,
     }
@@ -56,7 +55,6 @@ pub mod atomic_register {
             //let (ts, wr, data) = sectors_manager.read_metadata(); // this needs particular secor
             Box::new(Nnar {
                 self_identifier,
-                process_identifier: 42, // TODO skad to wziac? może niepotrzebne?
                 read_ident: 0,
                 readlist: HashMap::new(),
                 acklist: HashSet::new(),
@@ -67,7 +65,7 @@ pub mod atomic_register {
                 write_phase: false,
                 callback: None,
                 stable_storage: metadata,
-                sbeb: register_client,
+                register_client: register_client,
                 sectors_manager,
                 processes_count,
             })
@@ -140,9 +138,9 @@ pub mod atomic_register {
             let broadcast = Broadcast {
                 cmd: Arc::new(SystemRegisterCommand {
                     header: SystemCommandHeader {
-                        process_identifier: self.process_identifier, // TODO czy to jest dobrze
-                        msg_ident: Uuid::from_bytes(
-                            (cmd.header.request_identifier as u128).to_ne_bytes(),
+                        process_identifier: self.self_identifier,
+                        msg_ident: Uuid::from_u128(
+                            (cmd.header.request_identifier as u128)
                         ),
                         read_ident: self.read_ident,
                         sector_idx: cmd.header.sector_idx,
@@ -150,14 +148,15 @@ pub mod atomic_register {
                     content: SystemRegisterCommandContent::ReadProc,
                 }),
             };
-            self.sbeb.broadcast(broadcast).await;
+            self.register_client.broadcast(broadcast).await;
         }
 
         /// Send system command to the register.
         async fn system_command(&mut self, cmd: SystemRegisterCommand) {
             let header = SystemCommandHeader {
-                process_identifier: self.process_identifier,
-                msg_ident: Uuid::from_bytes((cmd.header.process_identifier as u128).to_ne_bytes()),
+                process_identifier: self.self_identifier,
+                //msg_ident: Uuid::from_u128(cmd.header.process_identifier as u128),
+                msg_ident: cmd.header.msg_ident,
                 read_ident: self.read_ident,
                 sector_idx: cmd.header.sector_idx,
             };
@@ -176,7 +175,7 @@ pub mod atomic_register {
                         sector_data: data,
                     };
                     let sender = cmd.header.process_identifier;
-                    self.sbeb.send(crate::Send {
+                    self.register_client.send(crate::Send {
                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                         target: sender as usize,
                     }).await;
@@ -222,14 +221,14 @@ pub mod atomic_register {
                                     write_rank: r,
                                     data_to_write: read_data,
                                 };
-                                self.sbeb.broadcast(Broadcast {
+                                self.register_client.broadcast(Broadcast {
                                     cmd: Arc::new(SystemRegisterCommand { header, content }),
                                 }).await;
                             } else {
                                 let ts = maxts + 1;
                                 let wr = self.self_identifier;
                                 if let Some(writeval) = self.writeval.clone() {
-                                    let writeval_cloned = writeval.clone();
+                                    //let writeval_cloned = writeval.clone();
                                     let sec_idx = writeval.sector_idx;
                                     let data = writeval.data;
                                     self.sectors_manager.write(sec_idx, &(data.clone(), ts, wr)).await; // todo zastanowić się gdzie trzymac request_identifier
@@ -238,7 +237,7 @@ pub mod atomic_register {
                                         write_rank: self.self_identifier,
                                         data_to_write: data,
                                     };
-                                    self.sbeb.broadcast(Broadcast {
+                                    self.register_client.broadcast(Broadcast {
                                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                                     }).await;
                                 } else {
@@ -262,19 +261,17 @@ pub mod atomic_register {
                 } => {
                     let sec_idx = cmd.header.sector_idx;
                     let (ts, wr) = self.sectors_manager.read_metadata(sec_idx).await;
-                    let data = self.sectors_manager.read_data(sec_idx).await;
                     if timestamp > ts || (timestamp == ts && write_rank > wr) {
                         if let Some(writeval) = self.writeval.clone() {
                             let sec_idx = writeval.sector_idx;
-                            let data = writeval.data;
-                            self.sectors_manager.write(sec_idx, &(data, ts, wr)).await;
+                            self.sectors_manager.write(sec_idx, &(data_to_write, ts, wr)).await;
                         } else {
                             panic!("writaval = None w atomic_register 264 system_command handling Value")
                         }
                     }
                     let content = Ack;
                     let sender = cmd.header.process_identifier;
-                    self.sbeb.send(crate::Send {
+                    self.register_client.send(crate::Send {
                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                         target: sender as usize,
                     }).await;

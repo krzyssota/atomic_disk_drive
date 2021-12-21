@@ -39,8 +39,8 @@ pub struct PublicConfiguration {
 pub struct SectorVec(pub Vec<u8>);
 
 pub type SectorIdx = u64;
-pub type Timestamp_t = u64;
-pub type Rank_t = u8;
+pub type TimestampT = u64;
+pub type RankT = u8;
 
 #[derive(Debug, Clone)]
 pub enum RegisterCommand {

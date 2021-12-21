@@ -1,6 +1,6 @@
 pub use crate::domain::*;
 use std::collections::{HashMap, HashSet};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 mod domain;
 
 mod atomic_register;
@@ -9,19 +9,23 @@ mod sectors_manager;
 mod transfer;
 mod utils;
 use crate::RegisterCommand::{Client, System};
-use crate::SystemRegisterCommandContent::{Ack, Value};
 use async_channel::{unbounded, Receiver, Sender};
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 pub use stable_storage_public::*;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{mpsc, Mutex, RwLock};
+pub use transfer::transfer::serialize_client_response;
 pub use transfer_public::*;
 use uuid::Uuid;
 
-const REGISTER_COUNT: u8 = u8::MAX;
+//const REGISTER_COUNT: u8 = u8::MAX;
+const REGISTER_COUNT: u8 = 64;
 
 pub async fn run_register_process(config: Configuration) {
     let ident: u8 = config.public.self_rank;
@@ -51,23 +55,39 @@ pub async fn run_register_process(config: Configuration) {
             .storage_dir
             .clone()
             .join(format!("worker_{}", i));
+        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+            log::error!("Could not create stable storage directory for worker {}", i);
+            panic!();
+        }
         let ss = stable_storage_public::build_stable_storage(path).await;
-        let mut ar =
-            build_atomic_register(i + 1, ss, rc.clone(), sm.clone(), processes_count).await;
-        let (cmd_sender, cmd_receiver): (Sender<RegisterCommand>, Receiver<RegisterCommand>) =
-            unbounded();
+        let ar = build_atomic_register(config.public.self_rank, ss, rc.clone(), sm.clone(), processes_count).await;
+        let (src_sender, src_receiver) = unbounded();
+        let (crc_sender, crc_receiver) = unbounded();
 
-        cmd_senders.push(cmd_sender);
+        cmd_senders.push((src_sender, crc_sender));
 
         let op_comp_sender_clone = op_comp_sender.clone();
-        tokio::spawn(worker_loop(op_comp_sender_clone, cmd_receiver, ar, i));
+        tokio::spawn(worker_loop(
+            op_comp_sender_clone,
+            src_receiver,
+            crc_receiver,
+            ar,
+            i,
+        ));
     }
 
     loop {
         match tcp_listener.accept().await {
             Ok((tcp_stream, _)) => {
-                let (mut read_stream, write_stream) = tcp_stream.into_split();
-                tokio::spawn(send_response(op_comp_receiver.clone(), write_stream));
+                log::debug!("got connection {:?}", tcp_stream);
+                let (read_stream, write_stream) = tcp_stream.into_split();
+                let writer = Arc::new(Mutex::new(write_stream));
+                let key = config.hmac_client_key.clone();
+                tokio::spawn(recv_and_send_response_to_client(
+                    op_comp_receiver.clone(),
+                    writer.clone(),
+                    key,
+                ));
                 // receive self cmd
                 tokio::spawn(read_from_loopback(
                     loopback_receiver.clone(),
@@ -76,10 +96,17 @@ pub async fn run_register_process(config: Configuration) {
                     processes_count as u8,
                 ));
                 // receive cmd from client or another process
-                tokio::spawn(read_from_tcp(read_stream,
-                                           config.hmac_system_key.clone(),config.hmac_client_key.clone(),
-                                           cmd_senders.clone(),broadcast_pool.clone(),
-                processes_count as u8));
+                tokio::spawn(read_from_tcp(
+                    read_stream,
+                    writer.clone(),
+                    config.hmac_system_key.clone(),
+                    config.hmac_client_key.clone(),
+                    config.public.max_sector.clone(),
+                    cmd_senders.clone(),
+                    op_comp_sender.clone(),
+                    broadcast_pool.clone(),
+                    processes_count as u8,
+                ));
             }
             Err(e) => {
                 log::error!("Error while accepting connection on TcpListener: {:?}", e);
@@ -88,19 +115,55 @@ pub async fn run_register_process(config: Configuration) {
     }
 }
 
-async fn read_from_tcp(mut read_stream: OwnedReadHalf, system_key:  [u8; 64], client_key: [u8; 32],
-    cmd_senders: Vec<Sender<RegisterCommand>>, broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
-                       processes_count: u8,)  {
+async fn read_from_tcp(
+    mut read_stream: OwnedReadHalf,
+    write_stream: Arc<Mutex<OwnedWriteHalf>>,
+    system_key: [u8; 64],
+    client_key: [u8; 32],
+    max_sector: u64,
+    cmd_senders: Vec<(Sender<SystemRegisterCommand>, Sender<ClientRegisterCommand>)>,
+    op_comp_sender: Sender<OperationComplete>,
+    broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
+    processes_count: u8,
+) {
+    log::debug!("reading from tcp");
     loop {
-        match deserialize_register_command(
-            &mut read_stream,
-            &system_key,
-            &client_key,
-        )
-        .await
-        {
+        match deserialize_register_command(&mut read_stream, &system_key, &client_key).await {
             Ok((cmd, correct)) => {
-                if correct {
+                log::debug!("received cmd {:?} {}", cmd, correct);
+                if let Client(ClientRegisterCommand { header, content }) = cmd.clone() {
+                    if header.sector_idx < max_sector && correct {
+                        delegate_cmd(
+                            &cmd_senders,
+                            cmd,
+                            broadcast_pool.clone(),
+                            processes_count as u8,
+                        )
+                            .await;
+                        continue;
+                    } else {
+                        let mut status_code = StatusCode::AuthFailure;
+                        if header.sector_idx >= max_sector {
+                            status_code = StatusCode::InvalidSectorIndex
+                        }
+                        log::debug!("bad crc {:?} responding with {:?}", cmd, status_code);
+                        let op_return = match content {
+                            ClientRegisterCommandContent::Read => OperationReturn::Read(ReadReturn { read_data: None }),
+                            ClientRegisterCommandContent::Write { .. } => OperationReturn::Write,
+                        };
+                        let op_complete = OperationComplete {
+                            status_code,
+                            request_identifier: header.request_identifier,
+                            op_return
+                        };
+                        let mut data = vec![];
+                        serialize_client_response(op_complete, &mut data, client_key).await;
+                        let mut write = write_stream.lock().await;
+                        if let Err(e) = write.write_all(&data).await {
+                            log::error!("cannot write InvalidSectorIndex response to stream {:?}", e);
+                        }
+                    }
+                } else {
                     delegate_cmd(
                         &cmd_senders,
                         cmd,
@@ -108,8 +171,6 @@ async fn read_from_tcp(mut read_stream: OwnedReadHalf, system_key:  [u8; 64], cl
                         processes_count as u8,
                     )
                     .await;
-                } else {
-                    todo!(); // TODO handle msg with incorrect type
                 }
             }
             Err(e) => {
@@ -120,13 +181,16 @@ async fn read_from_tcp(mut read_stream: OwnedReadHalf, system_key:  [u8; 64], cl
 }
 async fn read_from_loopback(
     loopback_receiver: Receiver<SystemRegisterCommand>,
-    cmd_senders: Vec<Sender<RegisterCommand>>,
+    cmd_senders: Vec<(Sender<SystemRegisterCommand>, Sender<ClientRegisterCommand>)>,
     broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
     processes_count: u8,
 ) {
+    log::debug!("reading from loopback");
     loop {
+        log::debug!("trying to recv loopback");
         match loopback_receiver.recv().await {
             Ok(cmd) => {
+                log::debug!("Received from loopback {:?}", cmd);
                 delegate_cmd(
                     &cmd_senders,
                     RegisterCommand::System(cmd),
@@ -143,85 +207,139 @@ async fn read_from_loopback(
 }
 
 pub async fn delegate_cmd(
-    cmd_senders: &Vec<Sender<RegisterCommand>>,
+    cmd_senders: &Vec<(Sender<SystemRegisterCommand>, Sender<ClientRegisterCommand>)>,
     cmd: RegisterCommand,
     broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
     processes_count: u8,
 ) {
-    let mut sec_idx = 1;
+    log::debug!("delegating cmd {:?}", cmd);
+    let sec_idx;
     // adjust broadcasting_pool
     match cmd.clone() {
         Client(ClientRegisterCommand { header, content }) => {
-            let mut map = broadcast_pool.write().unwrap();
-            //HashSet::from([1..processes_count]),
-            let set = (1..processes_count).collect();
+            let mut map = broadcast_pool.write().await;
+            let set = (1..processes_count+1).collect();
+            log::debug!("proc_count {} set {:?}", processes_count,set);
             map.insert(Uuid::from_u128(header.request_identifier as u128), set);
+            log::debug!("it was crc {:?} map {:?}", header, map);
             sec_idx = header.sector_idx;
+            let (_, client_sender) = &cmd_senders[(sec_idx % REGISTER_COUNT as u64) as usize];
+            if let Err(e) = client_sender
+                .send(ClientRegisterCommand { header, content })
+                .await
+            {
+                log::error!(
+                    "cannot delegate crc (sector: {}) to worker: {:?}",
+                    sec_idx,
+                    e
+                );
+            }
         }
         System(SystemRegisterCommand { header, content }) => {
             match content {
-                (SystemRegisterCommandContent::Value { .. })
-                | SystemRegisterCommandContent::Ack => {
-                    let mut map = broadcast_pool.write().unwrap();
-                    let set: &mut HashSet<u8> = map.get_mut(&header.msg_ident).unwrap(); // TODO handle instead of unwrap
-                    set.remove(&header.process_identifier);
-                    if set.is_empty() {
-                        (*map).remove(&header.msg_ident).unwrap();
+               /* SystemRegisterCommandContent::WriteProc {..}/* | SystemRegisterCommandContent::ReadProc*/ => {
+                    let mut map = broadcast_pool.write().await;
+                    log::debug!("delegating writeproc {:?} map {:?}", header, map);
+                    let set = (1..processes_count+1).collect();
+                    log::debug!("proc_count {} set {:?} msg_ident {}", processes_count, set, header.msg_ident);
+                    map.insert(header.msg_ident, set);
+                    log::debug!("it was writeproc {:?} map {:?}", header, map);
+                },*/
+                /*SystemRegisterCommandContent::Value { .. }*/ | SystemRegisterCommandContent::Ack => {
+                    let mut map = broadcast_pool.write().await;
+                    log::debug!("delegating value/ack  curr map {:?}", map);
+                    if let Some(set) = map.get_mut(&header.msg_ident) {
+                        log::debug!("delegating value/ack 2 curr set {:?} removing proc_ident {:?} from set", set, header.process_identifier);
+                        set.remove(&header.process_identifier);
+                        // TODO clear whole set if it is smaller than N/2 !!!!!
+                    } else {
+                        log::debug!("delegating value/ack 2 no set removing msg_ident {:?} from map", header.msg_ident);
+                        let res = (*map).remove(&header.msg_ident);
                     }
+                    log::debug!("it was Value|Ack {:?} with msg_ident {:?} map {:?}", cmd, header.msg_ident, map);
                 }
                 _ => {}
             }
             sec_idx = header.sector_idx;
+            let (system_sender, _) = &cmd_senders[(sec_idx % REGISTER_COUNT as u64) as usize];
+            if let Err(e) = system_sender
+                .send(SystemRegisterCommand { header, content })
+                .await
+            {
+                log::error!(
+                    "cannot delegate src (sector: {}) to worker: {:?}",
+                    sec_idx,
+                    e
+                );
+            }
         }
     };
-    let sender = &cmd_senders[(sec_idx % REGISTER_COUNT as u64) as usize];
-    sender.send(cmd);
 }
-
 async fn worker_loop(
     op_comp_sender: Sender<OperationComplete>,
-    cmd_receiver: Receiver<RegisterCommand>,
+    src_receiver: Receiver<SystemRegisterCommand>,
+    crc_receiver: Receiver<ClientRegisterCommand>,
     mut ar: Box<dyn AtomicRegister>,
     i: u8,
 ) {
+    let accepting_client_command = Arc::new(AtomicBool::new(true));
     loop {
-        match cmd_receiver.recv().await {
-            Ok(System(src)) => {
-                ar.as_mut().system_command(src);
-            }
-            Ok(Client(crc)) => {
-                let op_comp_sender_clone = op_comp_sender.clone();
-                let callback: Box<
-                    dyn FnOnce(
-                            OperationComplete,
-                        ) -> core::pin::Pin<
-                            Box<dyn core::future::Future<Output = ()> + core::marker::Send>,
-                        > + core::marker::Send
-                        + Sync,
-                > = Box::new(move |op_c| {
-                    tokio::spawn(async move {
-                        op_comp_sender_clone.send(op_c).await;
+        if accepting_client_command.load(Ordering::Relaxed) {
+            match crc_receiver.recv().await {
+                Err(e) => log::error!("worker: {} cannot recv crc {:?}", i, e),
+                Ok(crc) => {
+                    log::debug!("Worker {} got crc {:?}", i, crc);
+                    accepting_client_command.store(false, Ordering::Relaxed);
+                    let op_comp_sender_clone = op_comp_sender.clone();
+                    let accepting = accepting_client_command.clone();
+                    let callback: Box<
+                        dyn FnOnce(
+                                OperationComplete,
+                            ) -> core::pin::Pin<
+                                Box<dyn core::future::Future<Output = ()> + core::marker::Send>,
+                            > + core::marker::Send
+                            + Sync,
+                    > = Box::new(move |op_comp| {
+                        Box::pin(async move {
+                            log::debug!("Callback for {:?} is called", op_comp);
+                            if let Err(e) = op_comp_sender_clone.send(op_comp).await {
+                                log::error!(
+                                    "worker: {} cannot send op_complete in callback {:?}",
+                                    i,
+                                    e
+                                );
+                            }
+                            accepting.store(true, Ordering::Relaxed);
+                        })
                     });
-                    todo!(); // ^ this should be enough but types dont match
-                });
-                ar.as_mut().client_command(crc, callback);
+                    ar.as_mut().client_command(crc, callback).await;
+                }
             }
-            Err(e) => {
-                log::error!("worker: {:?}, recvError: {:?}", i + 1, e);
+        } else {
+            log::debug!("Worker {} trying to recv src", i);
+            match src_receiver.recv().await {
+                Err(e) => log::error!("worker: {} cannot recv src {:?}", i, e),
+                Ok(src) => {
+                    log::debug!("Worker {} received src {:?}", i, src);
+                    ar.as_mut().system_command(src).await
+                },
             }
         }
     }
 }
 
-async fn send_response(
+async fn recv_and_send_response_to_client(
     op_comp_receiver: Receiver<OperationComplete>,
-    write_stream: OwnedWriteHalf,
+    write_stream: Arc<Mutex<OwnedWriteHalf>>,
+    hmac_key: [u8; 32],
 ) {
     match op_comp_receiver.recv().await {
         Ok(op_complete) => {
-            let mut data: &[u8] = todo!(); // TODO write response on write_stream
-            write_stream.write_all(data);
-            todo!();
+            log::debug!("received op_complete {:?}", op_complete);
+            let mut data = vec![];
+            serialize_client_response(op_complete, &mut data, hmac_key).await; // TODO write response on write_stream
+            let mut write = write_stream.lock().await;
+            write.write_all(&data).await.unwrap(); // TODO handle
         }
         Err(e) => {
             log::error!("response worker, recvError: {:?}", e);
@@ -316,13 +434,12 @@ pub mod transfer_public {
     };
 
     use crate::utils::utils;
-    use crate::ClientRegisterCommandContent::Write;
     use crate::RegisterCommand::{Client, System};
     use crate::{
-        RegisterCommand, ACK_MSG_T, HMAC_TAG_SIZE, MAGIC_NUMBER, READ_MSG_T, READ_PROC_MSG_T,
+        RegisterCommand, ACK_MSG_T, HMAC_TAG_SIZE, MAGIC_NUMBER, READ_MSG_T, WRITE_MSG_T, READ_PROC_MSG_T,
         VALUE_MSG_T, WRITE_PROC_MSG_T,
     };
-    use std::io::{Error, ErrorKind};
+    use std::io::Error;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     pub async fn serialize_register_command(
@@ -339,7 +456,7 @@ pub mod transfer_public {
         let tag = utils::calculate_hmac_tag(&msg, hmac_key);
         msg.append(&mut tag.to_vec());
         writer.write_all(&msg).await.unwrap();
-        log::debug!("serialized msg length {:?}", msg.len());
+        //log::debug!("serialized msg length {:?}", msg.len());
         Ok(())
     }
 
@@ -348,50 +465,75 @@ pub mod transfer_public {
         hmac_system_key: &[u8; 64],
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), Error> {
-        log::debug!("deserializing register command");
-
-        // slide over bytes in the stream until it detects a valid magic number
-        let mut magic_buffer: [u8; 4] = [0; 4];
-        data.read_exact(&mut magic_buffer).await.unwrap();
-        while magic_buffer != MAGIC_NUMBER {
-            magic_buffer[0] = magic_buffer[1];
-            magic_buffer[1] = magic_buffer[2];
-            magic_buffer[2] = magic_buffer[3];
-            data.read_exact(&mut magic_buffer[3..4]).await.unwrap();
-        }
-
-        let mut msg: Vec<u8> = MAGIC_NUMBER.to_vec();
-        let mut buffer: [u8; 4] = [0; 4];
-        data.read_exact(&mut buffer).await.unwrap();
-        msg.append(&mut buffer.to_vec());
-        let msg_type = buffer[3];
-        let (rank, msg_type, key): (Option<u8>, u8, &[u8]) = match msg_type {
-            0x01 => (None, READ_MSG_T, hmac_client_key),
-            0x02 => (None, WRITE_PROC_MSG_T, hmac_client_key),
-            0x03 => (Some(buffer[2]), READ_PROC_MSG_T, hmac_system_key),
-            0x04 => (Some(buffer[2]), VALUE_MSG_T, hmac_system_key),
-            0x05 => (Some(buffer[2]), WRITE_PROC_MSG_T, hmac_system_key),
-            0x06 => (Some(buffer[2]), ACK_MSG_T, hmac_system_key),
-            t => {
-                // TODO / If a message type is invalid, the solution shall discard the magic number
-                // TODO / and the following 4 bytes (8 bytes in total).
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("msg_type not handled: {}", t),
-                ));
+        let mut start_over = true;
+        while start_over {
+            start_over = false;
+            // slide over bytes in the stream until it detects a valid magic number
+            let mut magic_buffer: [u8; 4] = [0; 4];
+            if let Err(e) = data.read_exact(&mut magic_buffer).await {
+                log::error!(
+                    "deserialize_register_command read_exact magic_buffer error {:?}",
+                    e
+                );
+                return Err(e);
             }
-        };
-        // TODO / In case of every other error, the solution shall consume the same number of bytes
-        // TODO / as if a message of this type was processed successfully.
-        let cmd = if let Some(rank) = rank {
-            deserialize_system_command(data, rank, msg_type, hmac_system_key, &mut msg).await
-        } else {
-            deserialize_client_command(data, msg_type, hmac_client_key, &mut msg).await
-        };
-        let mut tag_buffer: [u8; HMAC_TAG_SIZE] = [0; HMAC_TAG_SIZE];
-        data.read_exact(&mut tag_buffer).await.unwrap();
-        let verified = utils::verify_hmac_tag(&tag_buffer, &msg, key);
-        Ok((cmd, verified))
+            while magic_buffer != MAGIC_NUMBER {
+                magic_buffer[0] = magic_buffer[1];
+                magic_buffer[1] = magic_buffer[2];
+                magic_buffer[2] = magic_buffer[3];
+                data.read_exact(&mut magic_buffer[3..4]).await.unwrap();
+            }
+
+            let mut msg = MAGIC_NUMBER.to_vec();
+            let mut buffer: [u8; 4] = [0; 4];
+            if let Err(e) = data.read_exact(&mut buffer).await {
+                log::error!(
+                    "deserialize_register_command read_exact buffer error {:?}",
+                    e
+                );
+                return Err(e);
+            }
+            msg.append(&mut buffer.to_vec());
+            let (rank, msg_type, key): (Option<u8>, u8, &[u8]) = match buffer[3] {
+                0x01 => (None, READ_MSG_T, hmac_client_key),
+                0x02 => (None, WRITE_MSG_T, hmac_client_key),
+                0x03 => (Some(buffer[2]), READ_PROC_MSG_T, hmac_system_key),
+                0x04 => (Some(buffer[2]), VALUE_MSG_T, hmac_system_key),
+                0x05 => (Some(buffer[2]), WRITE_PROC_MSG_T, hmac_system_key),
+                0x06 => (Some(buffer[2]), ACK_MSG_T, hmac_system_key),
+                t => {
+                    start_over = true; // discard bytes and start over
+                    (Default::default(), Default::default(), (Default::default()))
+                }
+            };
+            if !start_over {
+                // everything correct until now
+                let res = if let Some(rank) = rank {
+                    deserialize_system_command(data, rank, msg_type, hmac_system_key, &mut msg)
+                        .await
+                } else {
+                    deserialize_client_command(data, msg_type, hmac_client_key, &mut msg).await
+                };
+                match res {
+                    Ok(Some(cmd)) => {
+                        let mut tag_buffer: [u8; HMAC_TAG_SIZE] = [0; HMAC_TAG_SIZE];
+                        if let Err(e) = data.read_exact(&mut tag_buffer).await {
+                            log::error!(
+                                "deserialize_register_command read_exact tag_buffer error {:?}",
+                                e
+                            );
+                            return Err(e);
+                        }
+                        let verified = utils::verify_hmac_tag(&tag_buffer, &msg, key);
+                        return Ok((cmd, verified));
+                    }
+                    Ok(None) => start_over = true, // consumed appropriate amount of bytes, starting over
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        log::error!("Bug in deserialize_register_command. Shouldn't leave while loop.");
+        panic!();
     }
 }
 
@@ -399,9 +541,8 @@ pub mod register_client_public {
     use crate::register_client::register_client::Stubborn;
     use crate::SystemRegisterCommand;
     use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, RwLock};
-    use tokio::sync::mpsc::UnboundedSender;
-    use tokio::sync::Mutex;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
     use uuid::Uuid;
 
     #[async_trait::async_trait]

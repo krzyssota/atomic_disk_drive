@@ -1,22 +1,47 @@
 pub mod transfer {
     use crate::RegisterCommand::{System};
-    use crate::{
-        ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand,
-        SectorVec, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent,
-        ACK_MSG_T, READ_MSG_T, READ_PROC_MSG_T, SECTOR_SIZE,
-        VALUE_MSG_T, WRITE_MSG_T, WRITE_PROC_MSG_T,
-    };
-    use std::convert::TryInto;
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+    use crate::{ClientCommandHeader, ReadReturn, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SectorVec, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, MAGIC_NUMBER, ACK_MSG_T, READ_MSG_T, READ_PROC_MSG_T, SECTOR_SIZE, VALUE_MSG_T, HMAC_TAG_SIZE, WRITE_MSG_T, WRITE_PROC_MSG_T, OperationComplete, OperationReturn};
+    use std::convert::{Infallible, TryInto};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use uuid::Uuid;
+    use crate::utils::utils;
+    use std::io::{Error, ErrorKind};
 
+
+
+    pub async fn serialize_client_response(op: OperationComplete,  writer: &mut (dyn AsyncWrite + Send + Unpin),
+                                           hmac_key: [u8; 32],) {
+        let mut msg: Vec<u8> = Vec::with_capacity(2 * 8 + HMAC_TAG_SIZE);
+        msg.append(&mut MAGIC_NUMBER.to_vec());
+        msg.append(&mut vec![0; 2]); // padding
+        msg.push(op.status_code as u8);
+        match op.op_return {
+            OperationReturn::Read(_) => msg.push(READ_MSG_T + 0x40),
+            OperationReturn::Write => msg.push(WRITE_MSG_T + 0x40)
+        }
+        let mut req_id = op.request_identifier.to_be_bytes().to_vec();
+        msg.append(&mut req_id);
+        match op.op_return {
+            OperationReturn::Read(ReadReturn{read_data}) => {
+                if let Some(SectorVec(mut data)) = read_data {
+                    msg.append(&mut data)
+                } else {
+                    log::error!("serialize_client_response OperationComplete: {} came with None ReadReturn", op.request_identifier);
+                }
+            }
+            OperationReturn::Write => {}
+        }
+        let tag = utils::calculate_hmac_tag(&msg, &hmac_key);
+        msg.append(&mut tag.to_vec());
+        writer.write_all(&msg).await.unwrap();
+    }
 
     pub async fn serialize_client_command(
         cmd: &ClientRegisterCommand,
         writer: &mut (dyn AsyncWrite + Send + Unpin),
         msg: &mut Vec<u8>,
     ) {
-        log::debug!("serializing client command");
+        //log::debug!("serializing client command");
         msg.append(&mut vec![0; 3]); // padding
         let mut req_id = cmd.header.request_identifier.to_be_bytes().to_vec();
         let mut sec_idx = cmd.header.sector_idx.to_be_bytes().to_vec();
@@ -35,7 +60,7 @@ pub mod transfer {
                 msg.append(&mut vec);
             }
         };
-        log::debug!("msg {:?}", msg);
+        //log::debug!("msg {:?}", msg);
     }
 
     pub async fn serialize_system_command(
@@ -43,7 +68,7 @@ pub mod transfer {
         writer: &mut (dyn AsyncWrite + Send + Unpin),
         msg: &mut Vec<u8>,
     ) {
-        log::debug!("serializing system command");
+        //log::debug!("serializing system command");
         msg.append(&mut [0_u8; 2].to_vec()); // padding
         let mut rank = cmd.header.process_identifier.to_be_bytes().to_vec();
         msg.append(&mut rank);
@@ -92,7 +117,7 @@ pub mod transfer {
                 msg.append(&mut sec_idx);
             }
         };
-        log::debug!("msg {:?}", msg);
+        //log::debug!("msg {:?}", msg);
     }
 
     pub async fn deserialize_client_command(
@@ -100,12 +125,32 @@ pub mod transfer {
         msg_type: u8,
         hmac_key: &[u8; 32],
         msg: &mut Vec<u8>,
-    ) -> RegisterCommand {
+    ) -> Result<Option<RegisterCommand>, Error> {
+        let mut err = false;
         let mut buffer: [u8; 16] = [0; 16];
-        data.read_exact(&mut buffer).await.unwrap();
+        if let Err(e) = data.read_exact(&mut buffer).await {
+            log::error!("deserialize_system_command read_exact buffer error {:?}", e);
+            return Err(e);
+        }
         msg.append(&mut buffer.to_vec());
-        let req_no: u64 = u64::from_be_bytes(buffer[..8].try_into().unwrap());
-        let sec_idx: u64 = u64::from_be_bytes(buffer[8..].try_into().unwrap());
+        //let req_no: u64 = u64::from_be_bytes(buffer[..8].try_into().unwrap());
+        //let sec_idx: u64 = u64::from_be_bytes(buffer[8..].try_into().unwrap());
+        let req_no = match buffer[..8].try_into() {
+            Ok(bytes) => u64::from_be_bytes(bytes),
+            Err(e) => {
+                err = true;
+                log::error!("Cannot get request number {:?}", e);
+                Default::default()
+            }
+        };
+        let sec_idx = match buffer[8..].try_into() {
+            Ok(bytes) => u64::from_be_bytes(bytes),
+            Err(e) => {
+                err = true;
+                log::error!("Cannot get sector idx {:?}", e);
+                Default::default()
+            }
+        };
 
         let header = ClientCommandHeader {
             request_identifier: req_no,
@@ -115,18 +160,26 @@ pub mod transfer {
             0x01 => ClientRegisterCommandContent::Read,
             0x02 => {
                 let mut content_buffer: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
-                data.read_exact(&mut content_buffer).await.unwrap();
+                if let Err(e) = data.read_exact(&mut content_buffer).await {
+                    log::error!("deserialize_system_command read_exact content_buffer error {:?}", e);
+                    return Err(e);
+                }
                 msg.append(&mut content_buffer.to_vec());
                 ClientRegisterCommandContent::Write {
                     data: SectorVec(Vec::from(content_buffer)),
                 }
             }
-            _ => {
-                log::error!("Bug in deserialize_client_command. unknown msg_type should already be handled in deserialize_register_command");
-                panic!();
+            t => {
+                log::error!("Bug in deserialize_client_command. unknown msg_type {} should already be handled in deserialize_register_command", t);
+                return Ok(None);
             }
         };
-        RegisterCommand::Client(ClientRegisterCommand { header, content })
+        if err {
+            Ok(None) // consumed appropriate number of bytes
+        } else {
+            Ok(Some(RegisterCommand::Client(ClientRegisterCommand { header, content })))
+        }
+
     }
 
     pub async fn deserialize_system_command(
@@ -135,26 +188,63 @@ pub mod transfer {
         msg_type: u8,
         hmac_system_key: &[u8; 64],
         msg: &mut Vec<u8>,
-    ) -> RegisterCommand {
+    ) -> Result<Option<RegisterCommand>, Error> {
         let mut buffer: [u8; 32] = [0; 32];
         data.read_exact(&mut buffer).await.unwrap();
         msg.append(&mut buffer.to_vec());
-        let uuid = Uuid::from_bytes(buffer[..16].try_into().unwrap());
-        let rid_rop = u64::from_be_bytes(buffer[16..24].try_into().unwrap());
-        let sec_idx = u64::from_be_bytes(buffer[24..].try_into().unwrap());
+        let mut err = false;
+
+        //let uuid = Uuid::from_bytes(buffer[..16].try_into());
+        let uuid = match buffer[..16].try_into() {
+            Ok(bytes) => Uuid::from_bytes(bytes),
+            Err(e) => {
+                err = true;
+                log::error!("Cannot get uuid {:?}", e);
+                Default::default()
+            }
+        };
+        //let rid_rop = u64::from_be_bytes(buffer[16..24].try_into().unwrap());
+        let rid = match buffer[16..24].try_into() {
+            Ok(bytes) => u64::from_be_bytes(bytes),
+            Err(e) => {
+                err = true;
+                log::error!("Cannot get read identifier {:?}", e);
+                Default::default()
+            }
+        };
+        //let sec_idx = u64::from_be_bytes(buffer[24..].try_into().unwrap());
+        let sec_idx = match buffer[24..].try_into() {
+            Ok(bytes) => u64::from_be_bytes(bytes),
+            Err(e) => {
+                err = true;
+                log::error!("Cannot get sector index {:?}", e);
+                Default::default()
+            }
+        };
         let header = SystemCommandHeader {
             process_identifier: rank,
             msg_ident: uuid,
-            read_ident: rid_rop,
+            read_ident: rid,
             sector_idx: sec_idx,
         };
         let content = match msg_type {
             0x03 => SystemRegisterCommandContent::ReadProc,
             0x04 => {
                 let mut buffer: [u8; 16 + SECTOR_SIZE] = [0; 16 + SECTOR_SIZE];
-                data.read_exact(&mut buffer).await.unwrap();
+                if let Err(e) = data.read_exact(&mut buffer).await {
+                    log::error!("deserialize_system_command read_exact buffer error {:?}", e);
+                    return Err(e);
+                }
                 msg.append(&mut buffer.to_vec());
-                let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
+                //let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
+                let timestamp = match buffer[..8].try_into() {
+                    Ok(bytes) => u64::from_be_bytes(bytes),
+                    Err(e) => {
+                        err = true;
+                        log::error!("Cannot get timestamp {:?}", e);
+                        Default::default()
+                    }
+                };
                 // padding = buffer[8..15]
                 let write_rank = buffer[15];
                 let sec_data = SectorVec(buffer[16..].to_vec());
@@ -166,9 +256,20 @@ pub mod transfer {
             }
             0x05 => {
                 let mut buffer: [u8; 16 + SECTOR_SIZE] = [0; 16 + SECTOR_SIZE];
-                data.read_exact(&mut buffer).await.unwrap();
+                if let Err(e) = data.read_exact(&mut buffer).await {
+                    log::error!("deserialize_system_command read_exact buffer error {:?}", e);
+                    return Err(e);
+                }
                 msg.append(&mut buffer.to_vec());
-                let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
+                //let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
+                let timestamp = match buffer[..8].try_into() {
+                    Ok(bytes) => u64::from_be_bytes(bytes),
+                    Err(e) => {
+                        err = true;
+                        log::error!("Cannot get timestamp {:?}", e);
+                        Default::default()
+                    }
+                };
                 // padding = buffer[8..15]
                 let write_rank = buffer[15];
                 let sec_data = SectorVec(buffer[16..].to_vec());
@@ -180,10 +281,14 @@ pub mod transfer {
             }
             0x06 => SystemRegisterCommandContent::Ack,
             _ => {
-                log::error!("Bug in deserialize_client_command. unknown msg_type should already be handled in deserialize_register_command");
-                panic!();
+                log::error!("BUG in deserialize_client_command. unknown msg_type should already be handled in deserialize_register_command");
+                return Ok(None);
             }
         };
-        System(SystemRegisterCommand { header, content })
+        if err {
+            Ok(None) // consumed appropriate number of bytes
+        } else {
+            Ok(Some(System(SystemRegisterCommand { header, content })))
+        }
     }
 }
