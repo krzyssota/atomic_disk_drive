@@ -85,7 +85,7 @@ pub mod sectors_manager {
             if let Some((_, Metadata{ts, wr})) = (*meta).get(&idx) {
                 (*ts, *wr)
             } else {
-                log::error!("Getting meta of non existen idx {:?}", idx);
+                log::debug!("Getting meta of sector not yet written into {:?}", idx);
                 (0, 0)
             }
         }

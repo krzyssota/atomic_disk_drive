@@ -14,12 +14,6 @@ pub mod atomic_register {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    #[derive(Debug, Clone)]
-    struct RWVal {
-        request_identifier: u64,
-        sector_idx: SectorIdx,
-        data: SectorVec
-    }
     pub struct Nnar {
         self_identifier: u8,
         read_ident: u64,
@@ -27,8 +21,8 @@ pub mod atomic_register {
         acklist: HashSet<u8>,                        // acklist[q] := Ack;
         reading: bool,
         writing: bool,
-        writeval: Option<RWVal>,
-        readval: Option<RWVal>,
+        writeval: Option<SectorVec>,
+        readval: Option<SectorVec>,
         write_phase: bool,
         callback: Option<
             Box<
@@ -47,15 +41,18 @@ pub mod atomic_register {
     impl Nnar {
         pub async fn new(
             self_identifier: u8,
-            metadata: Box<dyn StableStorage>,
+            mut metadata: Box<dyn StableStorage>,
             register_client: Arc<dyn RegisterClient>,
             sectors_manager: Arc<dyn SectorsManager>,
             processes_count: usize,
         ) -> Box<dyn AtomicRegister> {
-            //let (ts, wr, data) = sectors_manager.read_metadata(); // this needs particular secor
+            let read_ident = match metadata.get(RID_KEY).await {
+                Some(bytes) => bincode::deserialize(&bytes).unwrap(),
+                None => 0
+            };
             Box::new(Nnar {
                 self_identifier,
-                read_ident: 0,
+                read_ident,
                 readlist: HashMap::new(),
                 acklist: HashSet::new(),
                 reading: false,
@@ -117,9 +114,9 @@ pub mod atomic_register {
                 trigger < sbeb, Broadcast | [READ_PROC, rid] >;
                         */
             self.callback = Some(operation_complete);
-            self.read_ident += 1;
             self.acklist.clear();
             self.readlist.clear();
+            self.read_ident += 1;
             self.stable_storage
                 .put(RID_KEY, &bincode::serialize(&self.read_ident).unwrap()).await.unwrap();
             match cmd.content {
@@ -128,13 +125,10 @@ pub mod atomic_register {
                 }
                 Write { data } => {
                     self.writing = true;
-                    self.writeval = Some(RWVal{
-                           request_identifier: cmd.header.request_identifier,
-                           sector_idx: cmd.header.sector_idx,
-                           data: data
-                    })
+                    self.writeval = Some(data);
                 }
             };
+            log::debug!("\nAR read handler me {} broadcasting readproc", self.self_identifier);
             let broadcast = Broadcast {
                 cmd: Arc::new(SystemRegisterCommand {
                     header: SystemCommandHeader {
@@ -157,7 +151,7 @@ pub mod atomic_register {
                 process_identifier: self.self_identifier,
                 //msg_ident: Uuid::from_u128(cmd.header.process_identifier as u128),
                 msg_ident: cmd.header.msg_ident,
-                read_ident: self.read_ident,
+                read_ident: cmd.header.read_ident,
                 sector_idx: cmd.header.sector_idx,
             };
             match cmd.content {
@@ -175,6 +169,7 @@ pub mod atomic_register {
                         sector_data: data,
                     };
                     let sender = cmd.header.process_identifier;
+                    log::debug!("\nAR proc:{} readproc handler sending value to {}", self.self_identifier, sender);
                     self.register_client.send(crate::Send {
                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                         target: sender as usize,
@@ -201,10 +196,22 @@ pub mod atomic_register {
                     write_rank: wr_,
                     sector_data: data_,
                 } => {
+                    log::debug!("\nAR proc:{} Value handler 1 sent by {} \n read_ident {} cmd.header.read_ident {} !write_phase {}",
+                        self.self_identifier, cmd.header.process_identifier, self.read_ident, cmd.header.read_ident, !self.write_phase);
+
                     if self.read_ident == cmd.header.read_ident && !self.write_phase {
                         let sender = cmd.header.process_identifier;
                         self.readlist.insert(sender, (ts_, wr_, data_));
-                        if self.readlist.len() > (self.processes_count / 2)
+                        log::debug!("\nAR proc:{} Value handler 2 sent by {}.\
+                        \n 2*#readlist={} >? processes_count={} \
+                        \n reading {} writin {},\
+                        \n read_list {:?} ack_list {:?}",
+                            self.self_identifier, sender,
+                            2 * self.readlist.len(), self.processes_count,
+                            self.reading, self.writing,
+                            self.readlist.keys(), self.acklist);
+
+                        if 2 * self.readlist.len() > self.processes_count
                             && (self.reading || self.writing)
                         {
                             let sec_idx = cmd.header.sector_idx;
@@ -212,10 +219,12 @@ pub mod atomic_register {
                             let data = self.sectors_manager.read_data(sec_idx).await;
                             self.readlist.insert(self.self_identifier, (ts, wr, data));
                             let (maxts, r, read_data) = Nnar::highest(self.readlist.clone());
+                            self.readval = Some(read_data.clone());
                             self.readlist.clear();
                             self.acklist.clear();
                             self.write_phase = true;
                             if self.reading {
+                                log::debug!("\nAR porc:{} Value quorum (reading). broadcasting Write_proc", self.self_identifier);
                                 let content = WriteProc {
                                     timestamp: maxts,
                                     write_rank: r,
@@ -225,22 +234,21 @@ pub mod atomic_register {
                                     cmd: Arc::new(SystemRegisterCommand { header, content }),
                                 }).await;
                             } else {
+                                log::debug!("\nAR proc:{} Value quorum (writing). broadcasting Write_proc", self.self_identifier);
                                 let ts = maxts + 1;
                                 let wr = self.self_identifier;
                                 if let Some(writeval) = self.writeval.clone() {
-                                    //let writeval_cloned = writeval.clone();
-                                    let sec_idx = writeval.sector_idx;
-                                    let data = writeval.data;
-                                    self.sectors_manager.write(sec_idx, &(data.clone(), ts, wr)).await; // todo zastanowić się gdzie trzymac request_identifier
+                                    self.sectors_manager.write(sec_idx, &(writeval.clone(), ts, wr)).await;
                                     let content = WriteProc {
                                         timestamp: ts,
-                                        write_rank: self.self_identifier,
-                                        data_to_write: data,
+                                        write_rank: wr,
+                                        data_to_write: writeval,
                                     };
                                     self.register_client.broadcast(Broadcast {
                                         cmd: Arc::new(SystemRegisterCommand { header, content }),
                                     }).await;
                                 } else {
+                                    log::error!("AR proc:{} value handler no writeval", self.self_identifier);
                                     panic!("writaval = None w atomic_register 251 system_command handling Value")
                                 }
                             }
@@ -259,15 +267,17 @@ pub mod atomic_register {
                     write_rank,
                     data_to_write,
                 } => {
+                    log::debug!("\nAR proc:{} writeproc handler sending ack to {}", self.self_identifier, cmd.header.process_identifier);
                     let sec_idx = cmd.header.sector_idx;
                     let (ts, wr) = self.sectors_manager.read_metadata(sec_idx).await;
                     if timestamp > ts || (timestamp == ts && write_rank > wr) {
-                        if let Some(writeval) = self.writeval.clone() {
+                        self.sectors_manager.write(sec_idx, &(data_to_write, timestamp, write_rank)).await;
+                       /* if let Some(writeval) = self.writeval.clone() {
                             let sec_idx = writeval.sector_idx;
                             self.sectors_manager.write(sec_idx, &(data_to_write, ts, wr)).await;
                         } else {
                             panic!("writaval = None w atomic_register 264 system_command handling Value")
-                        }
+                        }*/
                     }
                     let content = Ack;
                     let sender = cmd.header.process_identifier;
@@ -295,27 +305,22 @@ pub mod atomic_register {
                         if self.acklist.len() > (self.processes_count/2) && (self.reading || self.writing) {
                             self.acklist.clear();
                             self.write_phase = false;
-                            let (request_identifier, op_return) = if self.reading {
+                            let op_return= if self.reading {
                                 self.reading = false;
                                 if let Some(readval) = self.readval.clone() {
-                                    (readval.request_identifier,
-                                    OperationReturn::Read(ReadReturn { read_data: Some(readval.data) }))
+                                    OperationReturn::Read(ReadReturn { read_data: Some(readval) })
                                 } else {
+                                    log::error!("AR proc:{} ack handler no readval", self.self_identifier);
                                     panic!("readval = None w atomic_register 308 system_command handling Ack")
                                 }
                             } else {
-                              self.writing = false;
-                                if let Some(writeval) = self.writeval.clone() {
-                                    (writeval.request_identifier,
-                                     OperationReturn::Write)
-                                } else {
-                                    panic!("writaval = None w atomic_register 308 system_command handling Ack")
-                                }
+                                self.writing = false;
+                                OperationReturn::Write
                             };
                             if let Some(_) = self.callback {
                                 (self.callback.take().unwrap())(OperationComplete{
                                     status_code: StatusCode::Ok,
-                                    request_identifier,
+                                    request_identifier: cmd.header.msg_ident.as_u128() as u64,
                                     op_return
                                 }).await;
                             }

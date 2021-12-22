@@ -3,7 +3,7 @@ pub mod register_client {
         serialize_register_command, Broadcast, RegisterClient, RegisterCommand,
         SystemRegisterCommand,
     };
-    use async_channel::{ Sender};
+    use async_channel::Sender;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
@@ -14,10 +14,9 @@ pub mod register_client {
 
     pub struct Stubborn {
         self_identifier: u8,
-        tcp_streams: Vec<Mutex<Option<TcpStream>>>,
+        tcp_streams: Arc<Mutex<Vec<Option<TcpStream>>>>,
         tcp_locations: Vec<(String, u16)>,
         loopback: Sender<SystemRegisterCommand>,
-        buffered_msgs: Mutex<HashMap<Uuid, SystemRegisterCommand>>,
         hmac_system_key: [u8; 64],
         broadcast_pool: Arc<RwLock<HashMap<Uuid, HashSet<u8>>>>,
     }
@@ -32,14 +31,13 @@ pub mod register_client {
         ) -> Self {
             let mut tcp_streams = Vec::with_capacity(tcp_locations.len());
             for _ in 0..tcp_locations.len() {
-                tcp_streams.push(Mutex::new(None));
+                tcp_streams.push(None);
             }
             Stubborn {
                 self_identifier: ident,
-                tcp_streams,
+                tcp_streams: Arc::new(Mutex::new(tcp_streams)),
                 tcp_locations,
                 loopback: sender,
-                buffered_msgs: Mutex::new(HashMap::new()),
                 hmac_system_key,
                 broadcast_pool,
             }
@@ -47,12 +45,12 @@ pub mod register_client {
 
         async fn send_cmd(&self, proc_ident: u8, cmd: SystemRegisterCommand) {
             if proc_ident == self.self_identifier {
-                log::debug!("sending cmd {:?} through loopback", cmd.header);
+                log::debug!("\nSEND cmd to myself {} through loopback {:?} ", self.self_identifier, cmd);
                 if let Err(e) = self.loopback.send(cmd).await {
                     log::error!("reg_client:{}, loopback error {}", self.self_identifier, e);
                 }
             } else {
-                log::debug!("sending cmd {:?} through tcp", cmd.header);
+                log::debug!("\nSEND cmd from {} to {} through tcp {:?}", self.self_identifier, proc_ident, cmd);
                 let mut data = Vec::new();
                 match serialize_register_command(
                     &RegisterCommand::System(cmd),
@@ -75,25 +73,31 @@ pub mod register_client {
             let mut interval = interval(Duration::from_millis(100));
             loop {
                 interval.tick().await;
-                let mut stream_guard = self.tcp_streams[proc_ident as usize - 1].lock().await;
-                if let Some(stream) = stream_guard.as_mut() {
-                    if let Err(e) = stream.write_all(&data).await {
-                        log::error!(
-                            "reg_client:{}, stream.write_all error {}",
-                            self.self_identifier,
-                            e
-                        )
+                let mut vec_guard = self.tcp_streams.lock().await;
+                if let Some(stream) = &mut vec_guard[proc_ident as usize - 1] {
+                    match stream.write_all(&data).await {
+                        Err(e) => {
+                            log::error!(
+                                "reg_client:{}, stream.write_all error {}",
+                                self.self_identifier,
+                                e
+                            )
+                        }
+                        Ok(_) => break,
                     }
                 } else {
                     let (host, port) = &self.tcp_locations[proc_ident as usize - 1];
                     match tokio::net::TcpStream::connect((host.as_str(), *port)).await {
                         Ok(s) => {
-                            *stream_guard = Some(s);
-                            break;
+                            vec_guard[proc_ident as usize - 1] = Some(s);
                         }
                         Err(e) => {
-                            log::warn!("cannot reconnect with: ({}, {}) with error: {:?}", host, port, e);
-                            //continue;
+                            log::warn!(
+                                "cannot reconnect with: ({}, {}) with error: {:?}",
+                                host,
+                                port,
+                                e
+                            );
                         }
                     }
                 }
@@ -109,15 +113,90 @@ pub mod register_client {
         }
 
         async fn broadcast(&self, msg: Broadcast) {
-            let k = msg.cmd.header.msg_ident;
-            log::debug!("wanting to broadcast waiting on lock");
-            let map = self.broadcast_pool.read().await;
-            log::debug!("broadcasting msg.cmd {:?} map {:?}", msg.cmd.header, *map);
-            if let Some(set) = map.get(&k) {
-                for &proc_ident in set.iter() {
-                    self.send_cmd(proc_ident, msg.cmd.as_ref().clone()).await;
-                }
+            let broadcast_pool = self.broadcast_pool.clone();
+            let self_identifier = self.self_identifier;
+            let loopback = self.loopback.clone();
+            let tcp_streams = self.tcp_streams.clone();
+            let tcp_locations = self.tcp_locations.clone();
+            let cmd = msg.cmd.as_ref().clone();
+            let mut data = Vec::new();
+            if let Err(e) = serialize_register_command(
+                &RegisterCommand::System(cmd.clone()),
+                &mut data,
+                &self.hmac_system_key,
+            )
+            .await
+            {
+                log::error!(
+                    "reg_client:{}, serialize_register_command error {}",
+                    self.self_identifier,
+                    e
+                )
             }
+            tokio::spawn(async move {
+                let mut interval = interval(Duration::from_millis(100));
+                let mut i: u32 = 0;
+                loop {
+                    interval.tick().await;
+                    i+=1;
+                    let k = msg.cmd.header.msg_ident;
+                    let map = broadcast_pool.read().await;
+                    log::debug!("\nB i:{}. map: {:?}", i, *map);
+                    if let Some(set) = map.get(&k) {
+                        if set.is_empty() {
+                            break;
+                        } else {
+                            for &proc_ident in set.iter() {
+                                //self.send_cmd(proc_ident, msg.cmd.as_ref().clone()).await;
+                                if proc_ident == self_identifier {
+                                    log::debug!("\nB sending cmd through loopback to myself {} {:?}", proc_ident, cmd);
+                                    if let Err(e) = loopback.send(cmd.clone()).await {
+                                        log::error!(
+                                        "reg_client:{}, loopback error {}",
+                                        self_identifier,
+                                        e
+                                    );
+                                    }
+                                } else {
+                                    log::debug!("\nB sending cmd from {} to {} through tcp {:?}", self_identifier ,proc_ident ,cmd);
+                                    //self.send_serialized_cmd_over_tcp(proc_ident, data.clone()).await
+                                    let mut vec_guard = tcp_streams.lock().await;
+                                    if let Some(stream) = &mut vec_guard[proc_ident as usize - 1] {
+                                        log::debug!("\nB me {} Some(stream) to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
+                                        if let Err(e) = stream.write_all(&data).await {
+                                            log::error!(
+                                                "reg_client:{}, stream.write_all error {}",
+                                                self_identifier,
+                                                e
+                                            )
+                                        }
+                                    } else {
+                                        let (host, port) = &tcp_locations[proc_ident as usize - 1];
+                                        match tokio::net::TcpStream::connect((host.as_str(), *port))
+                                            .await
+                                        {
+                                            Ok(s) => {
+                                                log::debug!("\nB me {} None stream but reconnected to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
+                                                vec_guard[proc_ident as usize - 1] = Some(s);
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                "cannot reconnect with: ({}, {}) with error: {:?}",
+                                                host,
+                                                port,
+                                                e
+                                            );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
         }
     }
 }
