@@ -75,16 +75,15 @@ pub mod register_client {
                 interval.tick().await;
                 let mut vec_guard = self.tcp_streams.lock().await;
                 if let Some(stream) = &mut vec_guard[proc_ident as usize - 1] {
-                    match stream.write_all(&data).await {
-                        Err(e) => {
+                    if let Err(e) = stream.write_all(&data).await {
+
                             log::error!(
                                 "reg_client:{}, stream.write_all error {}",
                                 self.self_identifier,
                                 e
-                            )
-                        }
-                        Ok(_) => break,
+                            );
                     }
+                    break;
                 } else {
                     let (host, port) = &self.tcp_locations[proc_ident as usize - 1];
                     match tokio::net::TcpStream::connect((host.as_str(), *port)).await {
@@ -141,7 +140,9 @@ pub mod register_client {
                     i+=1;
                     let k = msg.cmd.header.msg_ident;
                     let map = broadcast_pool.read().await;
-                    log::debug!("\nB i:{}. map: {:?}", i, *map);
+                    if i <= 3 {
+                        log::debug!("\nB i:{}. map: {:?}", i, *map);
+                    }
                     if let Some(set) = map.get(&k) {
                         if set.is_empty() {
                             break;
@@ -149,7 +150,9 @@ pub mod register_client {
                             for &proc_ident in set.iter() {
                                 //self.send_cmd(proc_ident, msg.cmd.as_ref().clone()).await;
                                 if proc_ident == self_identifier {
-                                    log::debug!("\nB sending cmd through loopback to myself {} {:?}", proc_ident, cmd);
+                                    if i <= 3 {
+                                        log::debug!("\nB sending cmd through loopback to myself {} {:?}", proc_ident, cmd);
+                                    }
                                     if let Err(e) = loopback.send(cmd.clone()).await {
                                         log::error!(
                                         "reg_client:{}, loopback error {}",
@@ -158,11 +161,15 @@ pub mod register_client {
                                     );
                                     }
                                 } else {
-                                    log::debug!("\nB sending cmd from {} to {} through tcp {:?}", self_identifier ,proc_ident ,cmd);
+                                    if i <= 3 {
+                                        log::debug!("\nB sending cmd from {} to {} through tcp {:?}", self_identifier ,proc_ident ,cmd);
+                                    }
                                     //self.send_serialized_cmd_over_tcp(proc_ident, data.clone()).await
                                     let mut vec_guard = tcp_streams.lock().await;
                                     if let Some(stream) = &mut vec_guard[proc_ident as usize - 1] {
-                                        log::debug!("\nB me {} Some(stream) to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
+                                        if i <= 3 {
+                                            log::debug!("\nB me {} Some(stream) to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
+                                        }
                                         if let Err(e) = stream.write_all(&data).await {
                                             log::error!(
                                                 "reg_client:{}, stream.write_all error {}",
@@ -176,7 +183,9 @@ pub mod register_client {
                                             .await
                                         {
                                             Ok(s) => {
-                                                log::debug!("\nB me {} None stream but reconnected to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
+                                                if i <= 3 {
+                                                    log::debug!("\nB me {} None stream but reconnected to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
+                                                }
                                                 vec_guard[proc_ident as usize - 1] = Some(s);
                                             }
                                             Err(e) => {

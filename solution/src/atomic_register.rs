@@ -2,15 +2,12 @@ pub mod atomic_register {
 
     use crate::ClientRegisterCommandContent::{Read, Write};
     use crate::SystemRegisterCommandContent::{Ack, ReadProc, Value, WriteProc};
-    use crate::{
-        AtomicRegister, Broadcast, ClientRegisterCommand, OperationComplete,
-        OperationReturn, ReadReturn, RegisterClient, SectorIdx, SectorVec, SectorsManager,
-        StableStorage, StatusCode, SystemCommandHeader, SystemRegisterCommand,
-        SystemRegisterCommandContent,
-    };
+    use crate::{AtomicRegister, Broadcast, ClientRegisterCommand, OperationComplete, OperationReturn, ReadReturn, RegisterClient, SectorVec, SectorsManager, StableStorage, StatusCode, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, SECTOR_SIZE};
     use std::collections::{HashMap, HashSet};
+    use std::fs::read;
     use std::future::Future;
     use std::pin::Pin;
+    use std::ptr::write;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -41,7 +38,7 @@ pub mod atomic_register {
     impl Nnar {
         pub async fn new(
             self_identifier: u8,
-            mut metadata: Box<dyn StableStorage>,
+            metadata: Box<dyn StableStorage>,
             register_client: Arc<dyn RegisterClient>,
             sectors_manager: Arc<dyn SectorsManager>,
             processes_count: usize,
@@ -69,6 +66,29 @@ pub mod atomic_register {
         }
 
         fn highest(list: HashMap<u8, (u64, u8, SectorVec)>) -> (u64, u8, SectorVec) {
+            let mut high_ts = 0;
+            let mut high_wr = 0;
+            let mut key = 0;
+
+            for  (i, (k, (ts, wr, _sector_vec))) in list.iter().enumerate() {
+                if i == 0 || *ts > high_ts || (*ts == high_ts && *wr > high_wr) {
+                    high_wr = *wr;
+                    high_ts = *ts;
+                    key = *k;
+                }
+            }
+            match list.get(&key) {
+                Some((t, w, d)) => {
+                    (t.clone(), w.clone(), d.clone())
+                },
+                None => {
+                    log::error!("BUGGGGG key:{:?} list:{:?}", key, list);
+                    panic!();
+                }
+            }
+        }
+
+       /* fn highest(list: HashMap<u8, (u64, u8, SectorVec)>) -> (u64, u8, SectorVec) {
             let list_cloned = list.clone();
             let (mut high_ts, mut high_r, init_val) = list_cloned.values().next().unwrap(); //"highest should be called if thera are N/2 records in readlist and apparently there are none"
             let mut val: SectorVec = init_val.clone();
@@ -80,7 +100,7 @@ pub mod atomic_register {
                 }
             }
             (high_ts, high_r, val)
-        }
+        }*/
     }
 
     #[async_trait::async_trait]
@@ -134,7 +154,7 @@ pub mod atomic_register {
                     header: SystemCommandHeader {
                         process_identifier: self.self_identifier,
                         msg_ident: Uuid::from_u128(
-                            (cmd.header.request_identifier as u128)
+                            cmd.header.request_identifier as u128
                         ),
                         read_ident: self.read_ident,
                         sector_idx: cmd.header.sector_idx,
@@ -163,6 +183,10 @@ pub mod atomic_register {
                     let sec_idx = cmd.header.sector_idx;
                     let (ts, wr) = self.sectors_manager.read_metadata(sec_idx).await;
                     let data = self.sectors_manager.read_data(sec_idx).await;
+                    let SectorVec(d) = data.clone();
+                    if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                        log::debug!("\nAR proc:{} reading from sector after ReadProc data[:-10] {:?}\ndata: {:?}", self.self_identifier, &d[SECTOR_SIZE-10..], d);
+                    }
                     let content = Value {
                         timestamp: ts,
                         write_rank: wr,
@@ -201,6 +225,10 @@ pub mod atomic_register {
 
                     if self.read_ident == cmd.header.read_ident && !self.write_phase {
                         let sender = cmd.header.process_identifier;
+                        let SectorVec(d) = data_.clone(); // TODO usunac
+                        if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                            log::debug!("\nAR proc:{} inserting data from Value into readlist data[:-10] {:?}\ndata: {:?}", self.self_identifier, &d[SECTOR_SIZE-10..], d);
+                        }
                         self.readlist.insert(sender, (ts_, wr_, data_));
                         log::debug!("\nAR proc:{} Value handler 2 sent by {}.\
                         \n 2*#readlist={} >? processes_count={} \
@@ -217,8 +245,17 @@ pub mod atomic_register {
                             let sec_idx = cmd.header.sector_idx;
                             let (ts, wr) = self.sectors_manager.read_metadata(sec_idx).await;
                             let data = self.sectors_manager.read_data(sec_idx).await;
+                            let SectorVec(d) = data.clone();
+                            if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                                log::debug!("\nAR proc:{} reading from sector after Value quorum data[:-10] {:?}\ndata: {:?}", self.self_identifier, &d[SECTOR_SIZE-10..], d);
+                            }
+
                             self.readlist.insert(self.self_identifier, (ts, wr, data));
                             let (maxts, r, read_data) = Nnar::highest(self.readlist.clone());
+                            let SectorVec(d) = read_data.clone(); // todo usunac
+                            if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                                log::debug!("\nAR proc:{} highest read_data after Value quorum data[:-10] {:?}\ndata: {:?}", self.self_identifier, &d[SECTOR_SIZE-10..], d);
+                            }
                             self.readval = Some(read_data.clone());
                             self.readlist.clear();
                             self.acklist.clear();
@@ -238,6 +275,11 @@ pub mod atomic_register {
                                 let ts = maxts + 1;
                                 let wr = self.self_identifier;
                                 if let Some(writeval) = self.writeval.clone() {
+                                    let SectorVec(d) = writeval.clone();
+                                    if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                                        log::debug!("\nAR d[0] {}, d[SECTOR_SIZE-1] {}, d[0] != d[SECTOR_SIZE-1] {}", d[0], d[SECTOR_SIZE-1], d[0] != d[SECTOR_SIZE-1]);
+                                        log::debug!("\nAR proc:{} writing to sector after Value (writing) quorum data[:-10] {:?}\ndata: {:?}", self.self_identifier, &d[SECTOR_SIZE-10..], d);
+                                    }
                                     self.sectors_manager.write(sec_idx, &(writeval.clone(), ts, wr)).await;
                                     let content = WriteProc {
                                         timestamp: ts,
@@ -271,6 +313,11 @@ pub mod atomic_register {
                     let sec_idx = cmd.header.sector_idx;
                     let (ts, wr) = self.sectors_manager.read_metadata(sec_idx).await;
                     if timestamp > ts || (timestamp == ts && write_rank > wr) {
+                        let SectorVec(d) = data_to_write.clone();
+                        if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                            log::debug!("\nAR proc:{} writing to sector in response to WriteProc data[:-10] {:?}\ndata:{:?}", self.self_identifier, &d[SECTOR_SIZE-10..], d);
+                            //  245, 138, 18, 62, 123
+                        }
                         self.sectors_manager.write(sec_idx, &(data_to_write, timestamp, write_rank)).await;
                        /* if let Some(writeval) = self.writeval.clone() {
                             let sec_idx = writeval.sector_idx;

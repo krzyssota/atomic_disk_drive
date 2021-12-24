@@ -1,12 +1,12 @@
 pub mod transfer {
     use crate::RegisterCommand::{System};
     use crate::{ClientCommandHeader, ReadReturn, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SectorVec, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, MAGIC_NUMBER, ACK_MSG_T, READ_MSG_T, READ_PROC_MSG_T, SECTOR_SIZE, VALUE_MSG_T, HMAC_TAG_SIZE, WRITE_MSG_T, WRITE_PROC_MSG_T, OperationComplete, OperationReturn};
-    use std::convert::{Infallible, TryInto};
+    use std::convert::{TryInto};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use uuid::Uuid;
     use crate::utils::utils;
-    use std::io::{Error, ErrorKind};
-
+    use std::io::{Error};
+    use crate::SystemRegisterCommandContent::WriteProc;
 
 
     pub async fn serialize_client_response(op: OperationComplete,  writer: &mut (dyn AsyncWrite + Send + Unpin),
@@ -38,7 +38,6 @@ pub mod transfer {
 
     pub async fn serialize_client_command(
         cmd: &ClientRegisterCommand,
-        writer: &mut (dyn AsyncWrite + Send + Unpin),
         msg: &mut Vec<u8>,
     ) {
         //log::debug!("serializing client command");
@@ -65,16 +64,43 @@ pub mod transfer {
 
     pub async fn serialize_system_command(
         cmd: &SystemRegisterCommand,
-        writer: &mut (dyn AsyncWrite + Send + Unpin),
         msg: &mut Vec<u8>,
     ) {
         //log::debug!("serializing system command");
         msg.append(&mut [0_u8; 2].to_vec()); // padding
+        log::debug!("SER padding {}", 2);
+
         let mut rank = cmd.header.process_identifier.to_be_bytes().to_vec();
+        log::debug!("SER rank {}", rank.len());
         msg.append(&mut rank);
+
+       /* let SystemRegisterCommand{header: _, content} = cmd;
+        let msg_type =  match content {
+                SystemRegisterCommandContent::Ack => {
+                    ACK_MSG_T
+                }
+                SystemRegisterCommandContent::Value{..} => {
+                    VALUE_MSG_T
+                }
+                SystemRegisterCommandContent::WriteProc{ .. } => {
+                    WRITE_PROC_MSG_T
+                }
+                SystemRegisterCommandContent::ReadProc => {
+                    READ_PROC_MSG_T
+                }
+            };
+        msg.push(msg_type);
+        log::debug!("SER msg_type {}", 1);*/
+
         let mut uuid = cmd.header.msg_ident.as_bytes().to_vec();
+        log::debug!("SER uuid {}", uuid.len());
+
         let mut rid = cmd.header.read_ident.to_be_bytes().to_vec();
+        log::debug!("SER rid {}", rid.len());
+
         let mut sec_idx = cmd.header.sector_idx.to_be_bytes().to_vec();
+        log::debug!("SER idx {}", sec_idx.len());
+
         match cmd.clone().content {
             SystemRegisterCommandContent::ReadProc => {
                 msg.push(READ_PROC_MSG_T);
@@ -92,8 +118,12 @@ pub mod transfer {
                 msg.append(&mut rid);
                 msg.append(&mut sec_idx);
                 msg.append(&mut timestamp.to_be_bytes().to_vec());
-                msg.append(&mut [0, 7].to_vec()); // padding
+                log::debug!("SER timestamp {}", timestamp.to_be_bytes().to_vec().len());
+                msg.append(&mut [0; 7].to_vec()); // padding
                 msg.push(write_rank);
+                log::debug!("SER data {}", data.len());
+                let d = data.clone();
+                log::info!("SER V {:?}", &d[SECTOR_SIZE-10..]);
                 msg.append(&mut data);
             }
             SystemRegisterCommandContent::WriteProc {
@@ -123,7 +153,6 @@ pub mod transfer {
     pub async fn deserialize_client_command(
         data: &mut (dyn AsyncRead + Send + Unpin),
         msg_type: u8,
-        hmac_key: &[u8; 32],
         msg: &mut Vec<u8>,
     ) -> Result<Option<RegisterCommand>, Error> {
         let mut err = false;
@@ -186,11 +215,11 @@ pub mod transfer {
         data: &mut (dyn AsyncRead + Send + Unpin),
         rank: u8,
         msg_type: u8,
-        hmac_system_key: &[u8; 64],
         msg: &mut Vec<u8>,
     ) -> Result<Option<RegisterCommand>, Error> {
         let mut buffer: [u8; 32] = [0; 32];
         data.read_exact(&mut buffer).await.unwrap();
+        log::info!("BOTTOM read buffer uuid,rid,sec_idx {:?}", &buffer);
         msg.append(&mut buffer.to_vec());
         let mut err = false;
 
@@ -235,6 +264,7 @@ pub mod transfer {
                     log::error!("deserialize_system_command read_exact buffer error {:?}", e);
                     return Err(e);
                 }
+                log::info!("\nDESER V \n[..20] {:?} \n[-16] {:?}", &buffer[..20], &buffer[SECTOR_SIZE..]);
                 msg.append(&mut buffer.to_vec());
                 //let timestamp = u64::from_be_bytes(buffer[..8].try_into().unwrap());
                 let timestamp = match buffer[..8].try_into() {
@@ -248,6 +278,8 @@ pub mod transfer {
                 // padding = buffer[8..15]
                 let write_rank = buffer[15];
                 let sec_data = SectorVec(buffer[16..].to_vec());
+                //let SectorVec(d) = sec_data.clone();
+                //log::info!("DESER V {:?}", &d[SECTOR_SIZE-10..]);
                 SystemRegisterCommandContent::Value {
                     timestamp,
                     write_rank,
@@ -273,6 +305,8 @@ pub mod transfer {
                 // padding = buffer[8..15]
                 let write_rank = buffer[15];
                 let sec_data = SectorVec(buffer[16..].to_vec());
+                let SectorVec(d) = sec_data.clone();
+                log::info!("DESER WP {:?}", &d[SECTOR_SIZE-10..]);
                 SystemRegisterCommandContent::WriteProc {
                     timestamp,
                     write_rank,

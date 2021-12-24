@@ -27,7 +27,7 @@ pub mod sectors_manager {
         }
 
         fn recover_metadata(
-            path: &PathBuf,
+            _path: &PathBuf,
         ) -> HashMap<SectorIdx, (String, Metadata)> {
             HashMap::new()
             // TODO actual recovery i usunać przy okazji smięci "tmp_xyz"
@@ -92,9 +92,15 @@ pub mod sectors_manager {
 
         async fn write(&self, idx: SectorIdx, sector: &(SectorVec, TimestampT, RankT)) {
             let (SectorVec(data), ts, wr) = sector;
+            let d = data.clone(); // todo usunac
+            let SECTOR_SIZE = 4096;
+            if d[0] != d[SECTOR_SIZE-1] || d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-2] ||d[0] != d[SECTOR_SIZE-4] ||d[0] != d[SECTOR_SIZE-5] {
+                log::info!("SM writing to sec {} data: {:?}", idx, data);
+            }
+            // 200, 60, 146, 31, 1
 
-            let mut tmp_path = self.dir.clone().join(format!("tmp_{}_{}_{}", idx, ts, wr));
-            let mut path = self.dir.clone().join(format!("{}_{}_{}", idx, ts, wr));
+            let tmp_path = self.dir.clone().join(format!("tmp_{}_{}_{}", idx, ts, wr));
+            let path = self.dir.clone().join(format!("{}_{}_{}", idx, ts, wr));
             {
                 let mut meta = self.cashed_metadata.write().await;
                 (*meta).insert(idx, (format!("{}_{}_{}", idx, ts, wr), Metadata{ts: *ts, wr: *wr}));
