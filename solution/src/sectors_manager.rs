@@ -38,12 +38,6 @@ pub mod sectors_manager {
         }
 
         async fn recover_metadata(&self) {
-            // TODO actual recovery i usunać przy okazji smięci "tmp_xyz"
-           /* for entry in &mut tokio::fs::read_dir(self.dir.clone()).await {
-                log::info!("SM REC readdir {:?}", entry);
-                let res = entry.next_entry().await;
-                log::info!("SM REC direntry {:?}", res);
-            }*/
             match tokio::fs::read_dir(self.dir.clone()).await {
                 Ok(mut entries) => {
                     let mut metas = vec![];

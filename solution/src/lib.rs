@@ -231,6 +231,8 @@ pub async fn delegate_cmd(
             let mut map = broadcast_pool.write().await;
             let set = (1..processes_count+1).collect();
             map.insert(Uuid::from_u128(header.request_identifier as u128), set);
+
+
             //log::debug!("\nDL {} crc. proc_count {} map {:?}  crc {:?}", ident, processes_count, map, cmd.clone());
             sec_idx = header.sector_idx;
             let cmd_sender = &cmd_senders[(sec_idx % REGISTER_COUNT as u64) as usize];
@@ -268,9 +270,13 @@ pub async fn delegate_cmd(
                     let mut map = broadcast_pool.write().await;
                     log::debug!("\ndelegating ack  curr map {:?}", map);
                     if let Some(set) = map.get_mut(&header.msg_ident) {
-                        log::debug!("\ndelegating value/ack 2 curr set {:?} removing proc_ident {:?} from set", set, header.process_identifier);
-                        set.remove(&header.process_identifier);
-                        // TODO clear whole set if it is smaller than N/2 !!!!!
+                        if 2* set.len() > processes_count as usize {
+                            log::debug!("\ndelegating value/ack 2 curr set {:?} removing proc_ident {:?} from set", set, header.process_identifier);
+                            set.remove(&header.process_identifier);
+                        } else {
+                            log::debug!("\ndelegating value/ack 2 no set removing msg_ident {:?} from map", header.msg_ident);
+                            (*map).remove(&header.msg_ident);
+                        }
                     } else {
                         log::debug!("\ndelegating value/ack 2 no set removing msg_ident {:?} from map", header.msg_ident);
                        (*map).remove(&header.msg_ident);
@@ -355,6 +361,7 @@ async fn worker_loop(
                         log::error!("BUG in worker loop. CRC paired with None. It should be Some(write stream).");
                     }
                     let write = write_option.unwrap();
+                    let req_id = crc.header.request_identifier;
                     let callback: Box<
                         dyn FnOnce(
                             OperationComplete,
@@ -362,9 +369,10 @@ async fn worker_loop(
                             Box<dyn core::future::Future<Output=()> + core::marker::Send>,
                         > + core::marker::Send
                         + Sync,
-                    > = Box::new(move |op_comp| {
+                    > = Box::new(move |mut op_comp| {
                         Box::pin(async move {
                             log::debug!("\nCallback for {:?} is called", op_comp);
+                            op_comp.request_identifier =  req_id;
                             let mut data = vec![];
                             serialize_client_response(op_comp, &mut data, hmac_key).await;
                             let mut write_stream = write.lock().await;

@@ -147,7 +147,9 @@ pub mod register_client {
                         if set.is_empty() {
                             break;
                         } else {
-                            for &proc_ident in set.iter() {
+                            let s = set.clone();
+                            drop(map);
+                            for &proc_ident in s.iter() {
                                 //self.send_cmd(proc_ident, msg.cmd.as_ref().clone()).await;
                                 if proc_ident == self_identifier {
                                     if i <= 3 {
