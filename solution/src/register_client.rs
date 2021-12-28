@@ -133,7 +133,7 @@ pub mod register_client {
                 )
             }
             tokio::spawn(async move {
-                let mut interval = interval(Duration::from_millis(100));
+                let mut interval = interval(Duration::from_millis(1000));
                 let mut i: u32 = 0;
                 loop {
                     interval.tick().await;
@@ -144,9 +144,6 @@ pub mod register_client {
                         log::debug!("\nB i:{}. map: {:?}", i, *map);
                     }
                     if let Some(set) = map.get(&k) {
-                        if set.is_empty() {
-                            break;
-                        } else {
                             let s = set.clone();
                             drop(map);
                             for &proc_ident in s.iter() {
@@ -181,14 +178,27 @@ pub mod register_client {
                                         }
                                     } else {
                                         let (host, port) = &tcp_locations[proc_ident as usize - 1];
-                                        match tokio::net::TcpStream::connect((host.as_str(), *port))
-                                            .await
+                                        match tokio::time::timeout(
+                                            Duration::from_millis(100),
+                                            tokio::net::TcpStream::connect((host.as_str(), *port))
+                                        ).await
+                                       /* match tokio::net::TcpStream::connect((host.as_str(), *port))
+                                            .await*/
                                         {
-                                            Ok(s) => {
+                                            /*Ok(s) => {*/
+                                            Ok(Ok(s)) => {
                                                 if i <= 3 {
                                                     log::debug!("\nB me {} None stream but reconnected to send to process {} cmd {:?}", self_identifier ,proc_ident ,cmd);
                                                 }
                                                 vec_guard[proc_ident as usize - 1] = Some(s);
+                                            },
+                                            Ok(Err(e)) => {
+                                                log::warn!(
+                                                "cannot reconnect with: ({}, {}) with error: {:?}",
+                                                host,
+                                                port,
+                                                e
+                                            );
                                             }
                                             Err(e) => {
                                                 log::warn!(
@@ -202,7 +212,6 @@ pub mod register_client {
                                     }
                                 }
                             }
-                        }
                     } else {
                         break;
                     }

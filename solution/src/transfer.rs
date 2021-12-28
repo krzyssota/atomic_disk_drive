@@ -6,11 +6,10 @@ pub mod transfer {
     use uuid::Uuid;
     use crate::utils::utils;
     use std::io::{Error};
-    use crate::SystemRegisterCommandContent::WriteProc;
 
 
     pub async fn serialize_client_response(op: OperationComplete,  writer: &mut (dyn AsyncWrite + Send + Unpin),
-                                           hmac_key: [u8; 32],) {
+                                           hmac_key: [u8; 32], fail: bool) {
         let mut msg: Vec<u8> = Vec::with_capacity(2 * 8 + HMAC_TAG_SIZE);
         msg.append(&mut MAGIC_NUMBER.to_vec());
         msg.append(&mut vec![0; 2]); // padding
@@ -23,10 +22,12 @@ pub mod transfer {
         msg.append(&mut req_id);
         match op.op_return {
             OperationReturn::Read(ReadReturn{read_data}) => {
-                if let Some(SectorVec(mut data)) = read_data {
-                    msg.append(&mut data)
-                } else {
-                    log::error!("serialize_client_response OperationComplete: {} came with None ReadReturn", op.request_identifier);
+                if !fail {
+                    if let Some(SectorVec(mut data)) = read_data {
+                        msg.append(&mut data)
+                    } else {
+                        log::error!("serialize_client_response OperationComplete: {} came with None ReadReturn", op.request_identifier);
+                    }
                 }
             }
             OperationReturn::Write => {}

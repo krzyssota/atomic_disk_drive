@@ -4,10 +4,8 @@ pub mod atomic_register {
     use crate::SystemRegisterCommandContent::{Ack, ReadProc, Value, WriteProc};
     use crate::{AtomicRegister, Broadcast, ClientRegisterCommand, OperationComplete, OperationReturn, ReadReturn, RegisterClient, SectorVec, SectorsManager, StableStorage, StatusCode, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, SECTOR_SIZE};
     use std::collections::{HashMap, HashSet};
-    use std::fs::read;
     use std::future::Future;
     use std::pin::Pin;
-    use std::ptr::write;
     use std::sync::Arc;
     use uuid::Uuid;
 

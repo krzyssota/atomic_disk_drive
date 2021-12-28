@@ -1,11 +1,10 @@
 pub mod sectors_manager {
     use crate::{RankT, TimestampT, SectorIdx, SectorVec, SectorsManager};
     use std::collections::HashMap;
-    use std::convert::TryInto;
     use std::path::{PathBuf};
     use std::sync::{Arc};
     use tokio::sync::{RwLock, Mutex};
-    use tokio::fs::{File, ReadDir};
+    use tokio::fs::{File};
     use tokio::io::AsyncWriteExt;
     use std::str::FromStr;
 
