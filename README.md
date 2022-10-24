@@ -11,7 +11,8 @@ A distributed register consists of multiple processes (entities of the distribut
 The smallest physical unit inside a block device is called a sector, and its size is specific to each device. A size of a block is always a multiple of the size of the sector. In the Atomic Disk Drive every sector is a separate atomic value called register (and thus it is said that the system supports a set of atomic values/registers). The sector has a size of 4096 bytes.
 
 As follows from the above description, a complete Atomic Disk Drive consists of two parts: a Linux block device driver, and a user-space library implementing the distributed register. The Linux block device driver is provided in the package (see instructions on how to use it), and you can use it to test your solution. Your task is to implement in Rust the user-space part as the distributed system.
-Distributed register
+
+## Distributed register
 
 Your implementation of the distributed register shall be based on an algorithm named (N, N)-AtomicRegister.
 (N, N)-AtomicRegister
@@ -105,7 +106,8 @@ upon event < sl, Deliver | q, [ACK, r] > such that r == rid and write_phase do
 The rank(*) returns a rank of an instance, which is a static number assigned to an instance. The highest(*) returns the largest value ordered by (timestamp, rank).
 
 Your solution will not be receiving special Recovery or Init events. Each time it starts, it shall try to recover from its stable storage (during the initial run, the stable storage will be empty). Crashes are expected to happen at any point, your solution shall work despite them. The algorithm presented above is only a pseudocode, so we suggest understanding ideas behind it.
-Linearization
+
+## Linearization
 
 Usually, components of a distributed system do not share a common clock. Atomic Disk Device does not have one too, and thus the events can happen at different rates and in various orders in every process. However, the atomic register enforces constraints between events on processes, and thereby it makes it possible to put all read and write operations on a single timeline, and to mark start and end of each operation. Every read returns the most recently written value. If an operation o happens before operation o' when the system is processing messages, then o must appear before o' on a such common timeline. This is called linearization.
 
